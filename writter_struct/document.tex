@@ -1,0 +1,114 @@
+\documentclass[withoutpreface,bwprint]{cumcmthesis} %去掉封面与编号页
+
+% ==================== 基础与中文支持 ====================
+\usepackage{ctex}                         % 中文支持（尽早加载）
+\usepackage{geometry}                     % 页面边距自定义
+
+% ==================== 数学与单位 ====================
+\usepackage{amsmath}                      % 数学公式增强
+\usepackage{amssymb}                      % 更多数学符号
+\usepackage{siunitx}                      % 科学计数法和单位格式化
+
+% ==================== 图片与浮动体 ====================
+\usepackage{graphicx}                     % 插入和管理图片
+\graphicspath{{texfile/figures/}}         % 集中管理图片路径
+\usepackage{float}                        % 灵活控制浮动体位置
+\usepackage{subcaption}                   % 子图标题，多图并排
+\usepackage[figuresright]{rotating}       % 图表旋转
+\usepackage{pdflscape}                    % 横页（PDF 感知，覆盖 lscape）
+\usepackage{afterpage}                    % 控制内容在下一页显示
+
+% ==================== 表格 ====================
+\usepackage{array}                        % 增强表格功能
+\usepackage{booktabs}                     % 优美的三线表
+\usepackage{tabularx}                     % 自适应宽度表格
+\usepackage{longtable}                    % 跨页长表格
+\usepackage{multicol}                     % 多栏排版
+
+% ==================== 列表与标题 ====================
+\usepackage{enumitem}                     % 列表样式自定义
+\usepackage{caption}                      % 图表标题样式自定义
+\usepackage{fancyhdr}                     % 页眉页脚自定义
+\usepackage{titlesec}                     % 章节标题样式自定义
+
+% ==================== 颜色与代码（xcolor 必须在 listings 前） ====================
+\usepackage{xcolor}                       % 颜色支持
+\usepackage{listings}                     % 代码插入与高亮
+
+% 通用代码样式
+\lstset{
+	numbers             =   left,               % 行号显示在左侧
+	showspaces          =   false,              % 不显示空格符号
+	numberstyle         =   \zihao{-5}\ttfamily,% 行号风格，小五号，等宽字体
+	showstringspaces    =   false,              % 不显示字符串中的空格
+	captionpos          =   t,                  % 标题位置在顶部
+	frame               =   lrtb,               % 显示四周边框
+	breaklines          =   true,               % 自动换行
+	columns             =   fixed,              % 固定列宽
+	basewidth           =   0.5em,              % 基础宽度
+	caption             =   \raggedright,       % 标题左对齐
+}
+
+% Python 代码样式
+\lstdefinestyle{Python}{
+	language        =   Python,
+	basicstyle      =   \zihao{-5}\ttfamily\color{black},
+	keywordstyle    =   \color{blue}\bfseries\itshape,
+	stringstyle     =   \color{magenta},
+	commentstyle    =   \color{red}\itshape,
+}
+
+% MATLAB 代码样式
+\lstdefinestyle{MATLAB}{
+	language        =   Matlab,
+	basicstyle      =   \zihao{-5}\ttfamily\color{black},
+	keywordstyle    =   \color{green}\bfseries\itshape,
+	stringstyle     =   \color{purple},
+	commentstyle    =   \color{gray}\itshape,
+}
+
+% ==================== 参考文献 ====================
+\usepackage[numbers,sort&compress]{natbib} % 排序与压缩（不需要 cite 包）
+
+% ==================== 超链接（最后加载） ====================
+\usepackage{hyperref}                     % PDF 跳转与超链接
+\hypersetup{
+	hidelinks,
+	colorlinks   = true,
+	allcolors    = black,
+	pdfstartview = Fit,
+	breaklinks   = true
+}
+
+\title{基于主要模型对关键词的研究}
+%\tihao{A}					%题号
+%\baominghao{4321}			%报名号
+%\schoolname{BIT}			%学校
+%\yearinput{2025}			%年份
+%\monthinput{09}			%月份
+%\dayinput{03}				%日期
+
+\begin{document}
+
+
+\input{texfile/1abstract}%摘要  abstract.tex
+
+\input{texfile/2ProblemRestatement}%插入问题重述   ProblemRestatement.tex
+
+\input{texfile/3ProblemAnalysis}%插入问题分析    ProblemAnalysis.tex
+
+\input{texfile/4AssumptionAndSign}%插入模型假设及符号说明  AssumptionAndSign.tex
+
+\input{texfile/5MakeModel} %插入模型的建立与求解   MakeModel.tex
+
+\input{texfile/6ErrorAnalysis} %插入误差分析   ErrorAnalysis.tex
+
+\input{texfile/7ModelEvaluation} %插入模型评价	ModelEvaluation.tex
+
+\input{texfile/8Reference} %插入参考文献   Reference.tex
+
+\input{texfile/9Appendix} %插入附录   Appendix.tex
+
+
+
+\end{document}
