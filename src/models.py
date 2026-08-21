@@ -26,7 +26,6 @@ MODEL_REGISTRY = {
         "base_url": "https://api.deepseek.com",
         "model": "deepseek-v4-flash",
         "api_key_env": "DEEPSEEK_API_KEY",
-        "thinking": "disabled",   # DeepSeek 专属：disabled / enabled
     },
     "gpt": {
         "label": "GPT (OpenAI)",
@@ -77,7 +76,9 @@ def get_model(name: str = None):
     api_key = os.getenv(cfg["api_key_env"], "") or "EMPTY"
 
     if key == "deepseek":
-        extra = {"thinking": {"type": cfg.get("thinking", "disabled")}}
+        # DeepSeek V4 系列默认 thinking，与 agent 的强制 tool_choice 互斥，
+        # 故固定 disabled 关闭思考模式，避免 400 报错。
+        extra = {"thinking": {"type": "disabled"}}
         return ChatDeepSeek(
             model=cfg["model"],
             base_url=cfg["base_url"],
@@ -97,7 +98,7 @@ def get_model(name: str = None):
 
 
 def list_models():
-    """返回所有可选模型（含所需 key 的变量名与提示、以及当前环境是否已配置）。"""
+    """返回所有可选模型（含所需 key 的变量名与提示、当前环境是否已配置）。"""
     return [
         {
             "key": k,

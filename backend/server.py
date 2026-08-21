@@ -223,7 +223,10 @@ async def get_models():
 async def get_model_config():
     """返回当前已保存的默认模型与已保存的 key"""
     _cfg = _load_config()
-    return {"model": _cfg.get("model", "deepseek"), "keys": _cfg.get("keys", {})}
+    return {
+        "model": _cfg.get("model", "deepseek"),
+        "keys": _cfg.get("keys", {}),
+    }
 
 @app.post("/api/model")
 async def set_model_config(body: ModelName):
