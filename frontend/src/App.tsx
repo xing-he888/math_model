@@ -9,8 +9,13 @@ import {
   listFiles,
   readFile,
   imageUrl,
+  fetchModels,
+  fetchModelConfig,
+  saveKeys,
+  FALLBACK_MODELS,
   type SseEvent,
   type WorkspaceFile,
+  type ModelOption,
 } from "./api";
 import "./App.css";
 
@@ -78,6 +83,14 @@ export default function App() {
   const [papers, setPapers] = useState<WorkspaceFile[]>([]);
   const [codes, setCodes] = useState<WorkspaceFile[]>([]);
   const [images, setImages] = useState<WorkspaceFile[]>([]);
+  // 模型选择：下拉框选项 / 当前选择 / 已保存的 key / 弹窗与保存状态
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(true);
+  const [selectedModel, setSelectedModel] = useState<string>("deepseek");
+  const [savedKeys, setSavedKeys] = useState<Record<string, string>>({});
+  const [showKeyModal, setShowKeyModal] = useState(false);
+  const [modalKeys, setModalKeys] = useState<Record<string, string>>({});
+  const [savingKeys, setSavingKeys] = useState(false);
   // 点击图片放大时记录文件名(show in 灯箱)，null 表示未放大
   const [zoomImage, setZoomImage] = useState<string | null>(null);
   // 灯箱内大图的缩放倍率(滚轮控制)
@@ -112,6 +125,22 @@ export default function App() {
     refreshWorkspace();
     return () => clearInterval(timer);
   }, [refreshWorkspace]);
+
+  // 启动时拉取可选模型与已保存的默认模型（配置一次一直可用）
+  // 若后端不可用，回退到内置模型清单，保证下拉框与 API Key 输入永不卡死
+  useEffect(() => {
+    let cancelled = false;
+    setModelsLoading(true);
+    fetchModels()
+      .then((ms) => { if (!cancelled) setModels(ms.length ? ms : FALLBACK_MODELS); })
+      .catch(() => { if (!cancelled) setModels(FALLBACK_MODELS); })
+      .finally(() => { if (!cancelled) setModelsLoading(false); });
+    fetchModelConfig().then((cfg) => {
+      setSelectedModel(cfg.model);
+      setSavedKeys(cfg.keys ?? {});
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   // 运行期间每 3 秒刷新一次工作区文件清单, 实时感知新生成的思路/代码/图片
   useEffect(() => {
@@ -158,6 +187,14 @@ export default function App() {
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
   }, [zoomImage]);
+
+  // 当前选中模型是否已具备可用的 key（环境已配置 或 已保存）
+  const currentModel = models.find((m) => m.key === selectedModel);
+  const currentEnv = currentModel?.api_key_env;
+  const keyReady = Boolean(currentEnv && (currentModel?.key_set || savedKeys[currentEnv]));
+  const missingCount = models.filter(
+    (m) => m.api_key_env && !(m.key_set || savedKeys[m.api_key_env]),
+  ).length;
 
   const handleEvent = useCallback(
     (ev: SseEvent) => {
@@ -211,11 +248,11 @@ export default function App() {
   );
 
   const run = useCallback(
-    async (resume: string | null) => {
+    async (resume: string | null, model?: string, apiKey?: string) => {
       abortRef.current = new AbortController();
       setStatus("running");
       try {
-        await startRun(threadId, resume, handleEvent, abortRef.current.signal);
+        await startRun(threadId, resume, handleEvent, abortRef.current.signal, model, apiKey);
       } catch (e: any) {
         if (e?.name !== "AbortError") {
           setStatus("error");
@@ -234,8 +271,9 @@ export default function App() {
     setFinalSummary("");
     setRunReports([]);
     setSelected(null);
-    run(null);
-  }, [status, run]);
+    const runKey = currentEnv && savedKeys[currentEnv] ? savedKeys[currentEnv] : undefined;
+    run(null, selectedModel, runKey);
+  }, [status, run, selectedModel, currentEnv, savedKeys]);
 
   const onSubmitAnswer = useCallback(() => {
     if (status !== "awaiting_input") return;
@@ -243,8 +281,35 @@ export default function App() {
     push({ kind: "user", label: "人工输入", content: text || "（回车跳过）" });
     setAnswer("");
     setQuestion(null);
-    run(text);
-  }, [status, answer, run, push]);
+    const runKey = currentEnv && savedKeys[currentEnv] ? savedKeys[currentEnv] : undefined;
+    run(text, selectedModel, runKey);
+  }, [status, answer, run, push, selectedModel, currentEnv, savedKeys]);
+
+  const onSaveKeys = useCallback(async () => {
+    setSavingKeys(true);
+    try {
+      const keys: Record<string, string> = {};
+      for (const [env, val] of Object.entries(modalKeys)) {
+        if (val && val.trim()) keys[env] = val.trim();
+      }
+      const res = await saveKeys(keys, selectedModel);
+      setSavedKeys(res.keys ?? {});
+      setModels((prev) =>
+        prev.map((m) => ({ ...m, key_set: res.present?.[m.api_key_env] ?? m.key_set })),
+      );
+      setShowKeyModal(false);
+      setModalKeys({});
+      push({
+        kind: "info",
+        label: "API Key 已保存",
+        content: `已持久化 ${Object.keys(keys).length} 项；下次启动默认模型：${res.model}`,
+      });
+    } catch (e: any) {
+      push({ kind: "error", label: "保存失败", content: String(e?.message ?? e) });
+    } finally {
+      setSavingKeys(false);
+    }
+  }, [modalKeys, selectedModel, push]);
 
   const onReset = useCallback(async () => {
     if (status === "running") {
@@ -286,10 +351,34 @@ export default function App() {
             {status === "done" && "已完成"}
             {status === "error" && "出错"}
           </div>
+          <div className="model-picker" title="下拉框选择本次运行使用的模型；点「API Key 配置」在弹窗里填写各模型密钥">
+            <label>模型</label>
+            <select
+              value={selectedModel}
+              onChange={(e) => setSelectedModel(e.target.value)}
+              disabled={status === "running"}
+              style={{ maxWidth: 160 }}
+            >
+              {modelsLoading && models.length === 0 && <option value="deepseek">deepseek（加载中…）</option>}
+              {models.map((m) => (
+                <option key={m.key} value={m.key}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+            <button
+              className="btn ghost"
+              onClick={() => setShowKeyModal(true)}
+              disabled={status === "running"}
+              title="在弹窗中配置各模型的 API Key（已配置的环境变量无需重复填写）"
+            >
+              API Key 配置{missingCount > 0 ? `（${missingCount} 项待填）` : "（已齐）"}
+            </button>
+          </div>
           <button className="btn ghost" onClick={onReset} disabled={status === "idle" && !logs.length}>
             重新开始
           </button>
-          <button className="btn primary" onClick={onStart} disabled={status === "running"} title="启动一次完整运行">
+          <button className="btn primary" onClick={onStart} disabled={status === "running" || !keyReady} title="启动一次完整运行">
             开始运行
           </button>
         </div>
@@ -437,6 +526,49 @@ export default function App() {
           />
           <div className="img-lightbox-cap">
             {zoomImage} · 滚轮缩放 / 双击全屏 / ← → 切换 · {Math.round(zoomScale * 100)}%
+          </div>
+        </div>
+      )}
+
+      {showKeyModal && (
+        <div className="modal-mask" onClick={() => setShowKeyModal(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <h3>配置 API Key</h3>
+              <button className="modal-close" onClick={() => setShowKeyModal(false)} title="关闭">×</button>
+            </div>
+            <p className="modal-tip">
+              已存在于系统环境 / 项目根 <code>.env</code> 的 Key 会标记为「已配置」，无需重复填写；
+              只填缺失的项即可。配置持久化到 <code>model_config.json</code>，下次启动默认模型为当前下拉所选。
+            </p>
+            <div className="key-rows">
+              {models.map((m) => {
+                const env = m.api_key_env;
+                const set = Boolean(m.key_set || savedKeys[env]);
+                return (
+                  <div className="key-row" key={m.key}>
+                    <div className="key-meta">
+                      <span className="key-name">{m.label}</span>
+                      <span className={`key-badge ${set ? "ok" : "no"}`}>
+                        {set ? "✓ 已配置" : "未配置"}
+                      </span>
+                    </div>
+                    <input
+                      type="password"
+                      placeholder={m.key_label}
+                      value={modalKeys[env] ?? ""}
+                      onChange={(e) => setModalKeys((prev) => ({ ...prev, [env]: e.target.value }))}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+            <div className="modal-foot">
+              <button className="btn ghost" onClick={() => setShowKeyModal(false)}>取消</button>
+              <button className="btn primary" onClick={onSaveKeys} disabled={savingKeys}>
+                {savingKeys ? "保存中…" : "保存"}
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -50,18 +50,86 @@ async function readSseStream(
   }
 }
 
+export interface ModelOption {
+  key: string;
+  label: string;
+  model: string;
+  api_key_env: string;
+  key_label: string;
+  /** 该模型的 key 环境变量当前是否已在进程环境中配置（系统环境 / .env） */
+  key_set?: boolean;
+}
+
+export interface ModelConfig {
+  model: string;
+  keys: Record<string, string>;
+}
+
+/** 后端不可用时兜底，保证下拉框与 API Key 输入永不卡死 */
+export const FALLBACK_MODELS: ModelOption[] = [
+  { key: "deepseek", label: "DeepSeek", model: "deepseek-v4-flash", api_key_env: "DEEPSEEK_API_KEY", key_label: "DeepSeek API Key" },
+  { key: "gpt", label: "GPT (OpenAI)", model: "gpt-4o", api_key_env: "OPENAI_API_KEY", key_label: "OpenAI API Key" },
+  { key: "glm", label: "GLM (智谱 Zhipu)", model: "glm-4-flash", api_key_env: "ZHIPU_API_KEY", key_label: "智谱 API Key" },
+  { key: "qwen", label: "通义千问 (Qwen)", model: "qwen-plus", api_key_env: "DASHSCOPE_API_KEY", key_label: "通义千问 API Key (DashScope)" },
+  { key: "kimi", label: "Kimi (Moonshot)", model: "moonshot-v1-8k", api_key_env: "MOONSHOT_API_KEY", key_label: "Kimi API Key (Moonshot)" },
+  { key: "mimo", label: "MiniMax (Mimo)", model: "MiniMax-Text-01", api_key_env: "MINIMAX_API_KEY", key_label: "MiniMax API Key" },
+];
+
+export async function fetchModels(): Promise<ModelOption[]> {
+  try {
+    const resp = await fetch(`${backendUrl()}/api/models`);
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return data.models ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchModelConfig(): Promise<ModelConfig> {
+  try {
+    const resp = await fetch(`${backendUrl()}/api/model`);
+    if (!resp.ok) return { model: "deepseek", keys: {} };
+    const data = await resp.json();
+    return { model: data.model ?? "deepseek", keys: data.keys ?? {} };
+  } catch {
+    return { model: "deepseek", keys: {} };
+  }
+}
+
+export interface SaveKeysResult {
+  model: string;
+  keys: Record<string, string>;
+  present: Record<string, boolean>;
+}
+
+/** 批量保存 API Key（可选同时设定默认模型），后端持久化到 model_config.json */
+export async function saveKeys(keys: Record<string, string>, model?: string): Promise<SaveKeysResult> {
+  const resp = await fetch(`${backendUrl()}/api/keys`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: model ?? "", keys }),
+  });
+  if (!resp.ok) throw new Error(`保存失败: ${resp.status}`);
+  return resp.json();
+}
+
 export async function startRun(
   threadId: string,
   resume: string | null,
   onEvent: (ev: SseEvent) => void,
   signal?: AbortSignal,
+  model?: string,
+  apiKey?: string,
 ): Promise<void> {
+  const body: Record<string, unknown> =
+    resume === null ? { thread_id: threadId } : { thread_id: threadId, resume };
+  if (model) body.model = model;
+  if (apiKey) body.api_key = apiKey;
   const resp = await fetch(`${backendUrl()}/api/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(
-      resume === null ? { thread_id: threadId } : { thread_id: threadId, resume },
-    ),
+    body: JSON.stringify(body),
     signal,
   });
   if (!resp.ok) {

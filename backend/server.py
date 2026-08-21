@@ -19,7 +19,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 
 # agent 使用 ./question ./dataset 等相对 CWD 的路径, 必须切到项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -34,10 +34,54 @@ from langgraph.types import Command
 from loguru import logger
 from pydantic import BaseModel
 
-from src.agent import graph, checkpointer
+from src.agent import graph, checkpointer, set_model, list_models
+from src.models import MODEL_REGISTRY
 
 DEFAULT_THREAD_ID = os.environ.get("MATH_THREAD_ID", "1111")
 DEFAULT_PORT = int(os.environ.get("MATH_BACKEND_PORT", "8000"))
+
+# ---------- 模型选择持久化（配置一次一直可用，类似 opencode 的配置文件） ----------
+CONFIG_PATH = PROJECT_ROOT / "model_config.json"
+
+def _load_config() -> dict:
+    try:
+        if CONFIG_PATH.exists():
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {"model": "deepseek", "keys": {}}
+
+def _load_model_config() -> str:
+    return _load_config().get("model", "deepseek")
+
+def _save_config(model: str, keys: dict | None = None) -> None:
+    cfg = _load_config()
+    cfg["model"] = model
+    if keys:
+        cfg.setdefault("keys", {})
+        cfg["keys"].update({k: v for k, v in keys.items() if v})
+    try:
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"保存模型配置失败: {e}")
+
+def _apply_keys(keys: dict | None) -> None:
+    """把已保存的 key 写回环境变量，但仅当作兜底：
+    若真实环境变量（系统 / .env，已由 src.agent 的 load_dotenv 载入）已存在，则保留真实值，
+    避免配置文件中陈旧的/错误的 key 覆盖掉正确的环境变量。"""
+    if not keys:
+        return
+    for k, v in keys.items():
+        if v and not os.environ.get(k):
+            os.environ[k] = v
+
+# 进程启动：先写入已保存的 key，再切到已保存的模型作为默认
+try:
+    _cfg = _load_config()
+    _apply_keys(_cfg.get("keys"))
+    set_model(_cfg.get("model", "deepseek"))
+except Exception as e:
+    logger.warning(f"初始化模型失败（将使用代码默认）: {e}")
 
 # 前端可读的工作区目录
 ALLOWED_WORK_DIRS = {"code", "paper", "photo", "dataset"}
@@ -54,10 +98,22 @@ app.add_middleware(
 _run_lock = asyncio.Lock()
 
 
+class ModelName(BaseModel):
+    """设置默认模型（持久化到 model_config.json），可选附带 API Key"""
+    model: str
+    api_key: Optional[str] = None
+
 class StreamBody(BaseModel):
-    """resume 缺省表示启动新运行; 提供时表示恢复被 interrupt 挂起的运行"""
+    """resume 缺省表示启动新运行; 提供时表示恢复被 interrupt 挂起的运行；model 指定本次运行的模型，api_key 为非 deepseek 模型必填"""
     resume: Optional[str] = None
     thread_id: Optional[str] = None
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+
+class KeysBody(BaseModel):
+    """批量保存 API Key（持久化到 model_config.json），可选同时设定默认模型；不会切换本次运行。"""
+    model: Optional[str] = None
+    keys: Dict[str, str] = {}
 
 
 def _sse(data: dict) -> str:
@@ -108,10 +164,21 @@ def _extract_interrupts(payload) -> list:
     return [{"value": getattr(it, "value", str(it))} for it in its]
 
 
-async def _stream_events(resume: Optional[str], thread_id: str):
+async def _stream_events(resume: Optional[str], thread_id: str, model: Optional[str] = None, api_key: Optional[str] = None):
     runtime_config = {"configurable": {"thread_id": thread_id}}
     try:
         async with _run_lock:
+            # 应用本次运行指定的模型（前端下拉框选择）
+            if model:
+                # 若请求带了 key，先写入对应环境变量
+                if api_key:
+                    _env = MODEL_REGISTRY.get(model, {}).get("api_key_env")
+                    if _env:
+                        os.environ[_env] = api_key
+                try:
+                    set_model(model)
+                except Exception as e:
+                    logger.warning(f"切换模型失败，沿用当前模型: {e}")
             if resume is not None:
                 inputs = Command(resume=resume)
             else:
@@ -147,6 +214,62 @@ async def _stream_events(resume: Optional[str], thread_id: str):
         yield _sse({"type": "error", "error": str(e)})
 
 
+@app.get("/api/models")
+async def get_models():
+    """返回所有可选模型（含所需 key 的变量名与提示），供前端下拉框读取"""
+    return {"models": list_models()}
+
+@app.get("/api/model")
+async def get_model_config():
+    """返回当前已保存的默认模型与已保存的 key"""
+    _cfg = _load_config()
+    return {"model": _cfg.get("model", "deepseek"), "keys": _cfg.get("keys", {})}
+
+@app.post("/api/model")
+async def set_model_config(body: ModelName):
+    """保存默认模型（持久化），可选附带 API Key，并立即切换"""
+    name = (body.model or "deepseek").strip().lower()
+    if name not in MODEL_REGISTRY:
+        raise HTTPException(400, f"未知模型: {name}（可用: {', '.join(MODEL_REGISTRY.keys())}）")
+    keys = None
+    if body.api_key:
+        _env = MODEL_REGISTRY[name]["api_key_env"]
+        os.environ[_env] = body.api_key
+        keys = {_env: body.api_key}
+    try:
+        set_model(name)
+    except Exception as e:
+        raise HTTPException(400, f"切换模型失败: {e}")
+    _save_config(name, keys)
+    return {"model": name, "status": "saved"}
+
+@app.post("/api/keys")
+async def save_keys(body: KeysBody):
+    """批量保存 API Key（持久化到 model_config.json），可选同时设定默认模型；不影响本次运行。
+    已存在于系统环境 / .env 的 key 无需重复提交，只提交缺失项即可。"""
+    cfg = _load_config()
+    cfg.setdefault("keys", {})
+    applied = {}
+    for env_name, val in (body.keys or {}).items():
+        if val and val.strip():
+            os.environ[env_name] = val.strip()
+            cfg["keys"][env_name] = val.strip()
+            applied[env_name] = val.strip()
+    if body.model:
+        name = body.model.strip().lower()
+        if name in MODEL_REGISTRY:
+            try:
+                set_model(name)
+                cfg["model"] = name
+            except Exception as e:
+                logger.warning(f"切换默认模型失败（沿用当前）: {e}")
+    try:
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"保存配置失败: {e}")
+    present = {env_name: bool(os.getenv(env_name)) for env_name in set(cfg["keys"].keys()) | {m["api_key_env"] for m in MODEL_REGISTRY.values()}}
+    return {"model": cfg.get("model", "deepseek"), "keys": cfg.get("keys", {}), "present": present}
+
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "time": time.time()}
@@ -166,9 +289,15 @@ async def get_state(thread_id: str = DEFAULT_THREAD_ID):
 @app.post("/api/stream")
 async def stream_run(body: StreamBody):
     thread_id = body.thread_id or DEFAULT_THREAD_ID
+    # 非 deepseek 必须有 API Key（本次请求携带，或已保存）
+    if body.model and body.model != "deepseek":
+        _env = MODEL_REGISTRY.get(body.model, {}).get("api_key_env")
+        _has = bool(body.api_key) or bool(_env and os.environ.get(_env))
+        if not _has:
+            raise HTTPException(400, f"使用 {body.model} 需要 API Key，请在下拉框填入后保存/运行")
     logger.info(f"线程 {thread_id} 收到运行请求, resume={body.resume is not None}")
     return StreamingResponse(
-        _stream_events(body.resume, thread_id),
+        _stream_events(body.resume, thread_id, body.model, body.api_key),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

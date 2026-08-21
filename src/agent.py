@@ -14,7 +14,7 @@ from langchain_core.messages import HumanMessage,AIMessage, SystemMessage, ToolM
 from dotenv import  load_dotenv
 from langgraph.prebuilt import ToolNode
 from langchain_core.tools import tool
-from langchain_deepseek import ChatDeepSeek
+from models import get_model, list_models, MODEL_REGISTRY, DEFAULT_MODEL
 from pypdf import PdfReader
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Send
@@ -32,18 +32,24 @@ import shutil
 #读取env文件中的apikey
 load_dotenv(override=True)
 
-# 模型
-model = ChatDeepSeek(
-    model = "deepseek-v4-flash",
-    extra_body={
-        "thinking":{
-            "type":"disabled"
-        }
-    }
-)
-
+# ---------- 模型（可配置：从注册表选择，支持 deepseek/gpt/glm/qwen/kimi/mimo） ----------
+# 通过环境变量 MATH_MODEL 选择要用的模型，例如 deepseek / gpt / glm / qwen / kimi / mimo
+# 新增模型：在 src/models.py 的 MODEL_REGISTRY 里加一项即可，无需改这里。
+model = get_model()
 model_with_tool=model.bind_tools(tools=tools)
 tool_node=ToolNode(tools=tools)
+
+# 运行时动态切换全局模型（前端/API 可调用），无需重启进程
+def set_model(name: str = None) -> str:
+    """重设 model / model_with_tool / model_with_struct 三个全局对象，返回实际生效的 key。"""
+    global model, model_with_tool, model_with_struct
+    key = (name or os.getenv("MATH_MODEL", DEFAULT_MODEL)).strip().lower()
+    if key not in MODEL_REGISTRY:
+        key = DEFAULT_MODEL
+    model = get_model(key)
+    model_with_tool = model.bind_tools(tools=tools)
+    model_with_struct = model.with_structured_output(schema=structed_output_state)
+    return key
 
 question_path='./question'
 dataset_path='./dataset'
@@ -65,7 +71,7 @@ class over_all_state(MessagesState):
     dataset_files: Annotated[str, '数据集文件名清单'] = ''
     answers: Annotated[List[Dict[str, str]], operator.add] = []
     code_files: Annotated[List[str], operator.add] = []
-    run_report: Annotated[List[Dict[str, str]], operator.add] = []
+    run_report: List[Dict[str, str]] = []
     failed_qs: Annotated[List[str], operator.add] = []
     done_pairs: Annotated[List[str], operator.add] = []
     compare_msgs: Annotated[List, operator.add] = []
@@ -288,6 +294,11 @@ PYTHON_EXE = os.environ.get("MATH_PYTHON_EXE") or sys.executable
 CODE_DIR = WORKSPACE_ROOT / "code"
 PHOTO_DIR = WORKSPACE_ROOT / "photo"
 
+# 出图脚本执行:子进程重试次数 + LLM 自动修复轮数上限(均防死循环)
+RUN_RETRY = 2
+LLM_MAX_FIX = 2
+RUN_TIMEOUT = 30
+
 #从"问题N"键中提取编号用于排序
 def _num_key(k: str) -> int:
     m = re.search(r"\d+", k)
@@ -413,7 +424,110 @@ def _sweep_pngs_to_photo() -> list:
         moved.append(dest.name)
     return moved
 
-#执行节点:只运行"负责生成图片"的脚本(静态检测 savefig/matplotlib),把代码生成的 png 移入 photo/
+# ---------- 出图脚本执行与自愈 ----------
+# 从脚本文本提取 savefig 指定的输出文件名,用于重入时判断图片是否已生成
+def _extract_savefig_paths(text: str) -> List[str]:
+    return [Path(m.group(1)).name for m in re.finditer(r"savefig\s*\(\s*[rR]?['\"]([^'\"]+)['\"]", text)]
+
+
+# 执行单个出图脚本一次,返回结构化结果(不移动图片)
+def _run_one_script(script: Path, timeout: int) -> dict:
+    before = set(CODE_DIR.rglob("*.png"))
+    try:
+        proc = subprocess.run(
+            [PYTHON_EXE, script.name],
+            cwd=str(CODE_DIR),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8", "MPLBACKEND": "Agg"},
+        )
+        return {
+            "returncode": proc.returncode,
+            "stdout": proc.stdout or "",
+            "stderr": proc.stderr or "",
+            "timed_out": False,
+            "new_imgs": list(set(CODE_DIR.rglob("*.png")) - before),
+            "exc": None,
+        }
+    except subprocess.TimeoutExpired:
+        return {"returncode": None, "stdout": "", "stderr": "", "timed_out": True, "new_imgs": [], "exc": None}
+    except Exception as e:
+        return {"returncode": None, "stdout": "", "stderr": "", "timed_out": False, "new_imgs": [], "exc": e}
+
+
+# 把新生成的 png 从 code/ 移入 photo/(同名冲突自动加后缀),返回移动后的文件名
+def _move_imgs_to_photo(imgs) -> List[str]:
+    moved = []
+    for img in imgs:
+        dest = PHOTO_DIR / img.name
+        i = 1
+        while dest.exists():
+            dest = PHOTO_DIR / f"{img.stem}_{i}{img.suffix}"
+            i += 1
+        shutil.move(str(img), str(dest))
+        moved.append(dest.name)
+    return moved
+
+
+# 把单次执行结果转成人类可读的错误摘要,成功时返回空串
+def _run_error_msg(r: dict, timeout: int) -> str:
+    if r["timed_out"]:
+        return f"运行超时({timeout}秒),已终止"
+    if r["exc"] is not None:
+        return f"运行出错: {r['exc']}"
+    if r["returncode"] != 0:
+        return f"运行失败(返回码 {r['returncode']})"
+    return ""
+
+
+# 提交 LLM 诊断并重写脚本:成功写回磁盘返回 True,否则 False
+def _llm_fix_script(script: Path, error_log: List[str], expected: List[str]) -> bool:
+    try:
+        code = script.read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:
+        logger.error(f"读取待修复脚本失败: {e}")
+        return False
+    log_text = "\n".join(error_log)[-2500:]
+    exp_hint = f"；期望生成的图片文件名: {expected}" if expected else ""
+    prompt = (
+        "你是一名 Python 绘图排障专家。下面是一段用于数学建模出图的 Python 脚本，运行时失败了。\n"
+        "请先诊断失败原因（重点排查：中文字体缺失/乱码、模块未安装、数据读取路径错误、"
+        "数据集文件不存在、数组维度/除零、死循环或超时等），然后直接返回修正后的【完整可运行】代码。\n\n"
+        f"错误日志（含返回码/stdout/stderr/是否超时）：\n{log_text}\n\n"
+        f"原始脚本：\n{code}\n\n"
+        "要求：\n"
+        "1. 必须用 ```python 代码块包裹完整代码，不要只给片段；\n"
+        "2. 必须保留原有的 plt.savefig(...) 调用，且文件名保持不变" + exp_hint + "，否则图片无法被收集；\n"
+        "3. 不要改变数据读取路径（数据在 dataset/ 下，使用相对路径 ..\\dataset\\文件名）；\n"
+        "4. 不要引入当前环境未安装的额外依赖；\n"
+        "5. 中文字体问题可降级为 plt.rcParams['font.sans-serif']=['Microsoft YaHei'] 或改用英文标签。\n"
+        "只输出代码块，不要多余解释。"
+    )
+    try:
+        resp = model.invoke([HumanMessage(prompt)])
+    except Exception as e:
+        logger.error(f"LLM 修复调用失败: {e}")
+        return False
+    m = re.search(r"```(?:[Pp]ython|[Pp]y3?)?\s*\n?(.*?)```", resp.content or "", re.S)
+    if not m:
+        return False
+    new_code = m.group(1).strip()
+    if not new_code:
+        return False
+    try:
+        script.write_text(new_code, encoding="utf-8")
+        return True
+    except Exception as e:
+        logger.error(f"写回修复脚本失败: {e}")
+        return False
+
+
+# 执行节点:只运行"负责生成图片"的脚本(静态检测 savefig/matplotlib);
+# 单个脚本失败自动重试 RUN_RETRY 次,仍失败则提交 LLM 诊断并改写代码(最多 LLM_MAX_FIX 轮),
+# 全部失败才中断交由人工处理。重入时跳过已生成图片的脚本,避免重复执行。
 def run_solutions(state: over_all_state) -> dict:
     logger.info('正在运行 run_solutions 节点')
     code_files = state.get("code_files") or []
@@ -437,44 +551,83 @@ def run_solutions(state: over_all_state) -> dict:
         else:
             reports.append({"file": rel, "status": "未运行(非出图脚本)"})
 
+    failed = []  # (rel, script, error_log)
+
     for rel, script in to_run:
-        before = set(CODE_DIR.rglob("*.png"))
-        try:
-            proc = subprocess.run(
-                [PYTHON_EXE, script.name],
-                cwd=str(CODE_DIR),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-                # MPLBACKEND=Agg: 脚本里的 plt.show() 变成空操作,防止弹窗阻塞被 timeout 杀死后图片移不走
-                env={**os.environ, "PYTHONIOENCODING": "utf-8", "MPLBACKEND": "Agg"},
+        expected = _extract_savefig_paths(script.read_text(encoding="utf-8", errors="ignore"))
+        # 重入跳过:期望图片已存在说明上一轮已成功
+        if expected and all((PHOTO_DIR / n).exists() for n in expected):
+            reports.append({"file": rel, "status": f"成功(已有图片,跳过): {expected}"})
+            continue
+
+        error_log: List[str] = []
+        success = False
+        moved: List[str] = []
+
+        # ① 子进程重试:1 次 + RUN_RETRY 次(重试时超时翻倍)
+        for attempt in range(1 + RUN_RETRY):
+            timeout = RUN_TIMEOUT if attempt == 0 else RUN_TIMEOUT * 2
+            r = _run_one_script(script, timeout)
+            msg = _run_error_msg(r, timeout)
+            if not msg:
+                moved = _move_imgs_to_photo(r["new_imgs"])
+                if moved:
+                    success = True
+                    reports.append({"file": rel, "status": f"成功,生成图片: {moved}（第{attempt + 1}次执行）"})
+                    break
+                msg = "运行成功但未生成任何图片(savefig 未生效?)"
+            error_log.append(
+                f"[第{attempt + 1}次执行] {msg}"
+                + (f" | stdout: {r['stdout'][:400]}" if r["stdout"] else "")
+                + (f" | stderr: {r['stderr'][:400]}" if r["stderr"] else "")
             )
-            new_imgs = list(set(CODE_DIR.rglob("*.png")) - before)
-            if proc.returncode == 0:
-                for img in new_imgs:
-                    dest = PHOTO_DIR / img.name
-                    i = 1
-                    while dest.exists():
-                        dest = PHOTO_DIR / f"{img.stem}_{i}{img.suffix}"
-                        i += 1
-                    shutil.move(str(img), str(dest))
-                report = {"file": rel, "status": f"成功,生成图片: {[p.name for p in new_imgs]}"}
-            else:
-                report = {"file": rel, "status": f"运行失败(返回码 {proc.returncode})",
-                          "output": (proc.stdout or "")[:800], "error": (proc.stderr or "")[:800]}
-        except subprocess.TimeoutExpired:
-            report = {"file": rel, "status": "运行超时(30秒),已终止"}
-        except Exception as e:
-            report = {"file": rel, "status": f"运行出错: {e}"}
-        reports.append(report)
-        logger.info(f"[run_solutions] {report}")
+
+        # ② LLM 审查 + 改写代码(最多 LLM_MAX_FIX 轮,每轮重跑一次)
+        fix_i = 0
+        while not success and fix_i < LLM_MAX_FIX:
+            fix_i += 1
+            logger.warning(f"[{rel}] 子进程重试失败,第 {fix_i} 次提交 LLM 诊断修复")
+            if not _llm_fix_script(script, error_log, expected):
+                error_log.append(f"[LLM 修复第{fix_i}轮] 未能解析出可运行代码块,放弃")
+                break
+            for attempt in range(1 + 1):
+                timeout = RUN_TIMEOUT if attempt == 0 else RUN_TIMEOUT * 2
+                r = _run_one_script(script, timeout)
+                msg = _run_error_msg(r, timeout)
+                if not msg:
+                    moved = _move_imgs_to_photo(r["new_imgs"])
+                    if moved:
+                        success = True
+                        reports.append({"file": rel, "status": f"成功,生成图片: {moved}（LLM 修复第{fix_i}轮后）"})
+                        break
+                    msg = "运行成功但未生成图片"
+                error_log.append(
+                    f"[LLM 修复第{fix_i}轮·第{attempt + 1}次执行] {msg}"
+                    + (f" | stderr: {r['stderr'][:400]}" if r["stderr"] else "")
+                )
+            if success:
+                break
+
+        if not success:
+            failed.append((rel, script, error_log))
+            reports.append({"file": rel, "status": f"失败:经 {RUN_RETRY} 次重试 + {LLM_MAX_FIX} 轮 LLM 修复仍未能出图"})
 
     # 收尾清扫:即使脚本失败/超时,已 savefig 落盘的 png 也一并移入 photo/
     remaining = _sweep_pngs_to_photo()
     if remaining:
         reports.append({"file": "(收尾清扫)", "status": f"移入图片: {remaining}"})
+
+    # ③ 终极兜底:仍有失败 → 中断交人工(可改脚本后回车重试,或输入 skip 跳过)
+    if failed:
+        detail = "\n\n".join(f"脚本: {rel}\n" + "\n".join(log) for rel, _, log in failed)
+        feedback = interrupt(
+            f"以下出图脚本经 {RUN_RETRY} 次重试 + {LLM_MAX_FIX} 轮 LLM 修复仍失败:\n\n"
+            f"{detail}\n\n"
+            "请处理:可直接修改 code/ 下对应脚本后回车重试;或输入 skip 跳过这些失败项继续。"
+        )
+        if "skip" in (feedback or "").strip().lower():
+            for rel, _, _ in failed:
+                reports.append({"file": rel, "status": "已由人工选择跳过"})
 
     return {"run_report": reports}
 
