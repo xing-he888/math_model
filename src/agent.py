@@ -1,4 +1,5 @@
 from langgraph.graph import StateGraph,START,END
+from langgraph.graph.message import add_messages
 from typing import TypedDict,List,Dict,Annotated
 from langgraph.graph import MessagesState
 from langgraph.types import interrupt, Command
@@ -18,7 +19,12 @@ from models import get_model, list_models, MODEL_REGISTRY, DEFAULT_MODEL
 from pypdf import PdfReader
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Send
-from tool import tools, write_workspace, WORKSPACE_ROOT
+from tool import tools as base_tools, write_workspace, WORKSPACE_ROOT
+from src.skills import load_skill_tools
+from src.skills.writing import read_writing_skill
+
+# 基础工具(tool.py)+ 可插拔 skill(src/skills/):新增 skill 只需在 src/skills/ 放一个模块并导出 tools 列表
+tools = base_tools + load_skill_tools()
 
 TOOLS_BY_NAME = {t.name: t for t in tools}
 import pandas as pd
@@ -74,8 +80,12 @@ class over_all_state(MessagesState):
     run_report: List[Dict[str, str]] = []
     failed_qs: Annotated[List[str], operator.add] = []
     done_pairs: Annotated[List[str], operator.add] = []
-    compare_msgs: Annotated[List, operator.add] = []
+    # 注意:必须用 add_messages 而非 operator.add——final_analysis 打回时会写入 RemoveMessage 删除指令,
+    # 只有 add_messages 能消化它;operator.add 会把指令本身拼进列表,后续 invoke 模型时抛 TypeError
+    compare_msgs: Annotated[List, add_messages] = []
     final_summary: Annotated[str, '最终总结'] = ''
+    article_chapters: Annotated[List[str], '已生成的论文章节'] = []
+    compile_status: Annotated[str, '论文编译验证状态'] = ''
 
 #定义格式化的状态，仅开始时使用
 class structed_output_state(TypedDict):
@@ -358,7 +368,7 @@ def solve_with_method(state: over_all_state) -> dict:
             "如需查资料或查看工作区已有文件,可调用 search / read_workspace 工具(work_dir 参数必填,只能是 code/paper/photo/dataset 之一,例如 read_workspace(work_dir=\"code\", rel_path=\"q1.py\"));\n"
             "不要调用写入类工具,思路与代码由系统自动保存。\n"
             "请给出该问在本方法下的完整求解,输出两部分:\n"
-            "1) 思路与公式: Markdown,含关键建模公式(LaTeX 语法 $...$),不写代码;\n"
+            "1) 思路与公式: Markdown,含关键建模公式(LaTeX 语法 $...$),不写代码;撰写中文表述时,请先调用 get_writing_skill 获取去 AI 味写作规范并严格遵循;\n"
             "2) 求解代码: 用 ```python 代码块包裹的完整可运行 Python 代码。代码规则:\n"
             f"   - 如需画图,必须用 plt.savefig(r\"{method}_{q_key}.png\") 保存到当前目录,文件名以方法名开头避免冲突;\n"
             "   - 画图前必须设置 matplotlib 中文字体: plt.rcParams['font.sans-serif']=['SimHei']; plt.rcParams['axes.unicode_minus']=False。"
@@ -617,17 +627,24 @@ def run_solutions(state: over_all_state) -> dict:
     if remaining:
         reports.append({"file": "(收尾清扫)", "status": f"移入图片: {remaining}"})
 
-    # ③ 终极兜底:仍有失败 → 中断交人工(可改脚本后回车重试,或输入 skip 跳过)
-    if failed:
+    # ③ 终极兜底:仍有失败 → 中断交人工,可多轮介入直到成功或放弃。
+    # 原理:interrupt 的 resume 会让本节点从头重跑——上方的自动恢复流程(含人工刚改的脚本)会再执行一遍;
+    # 若重跑后仍失败,下方 while 会再次 interrupt 询问,人工可继续修改再试,直到成功或输入 skip。
+    while failed:
         detail = "\n\n".join(f"脚本: {rel}\n" + "\n".join(log) for rel, _, log in failed)
         feedback = interrupt(
             f"以下出图脚本经 {RUN_RETRY} 次重试 + {LLM_MAX_FIX} 轮 LLM 修复仍失败:\n\n"
             f"{detail}\n\n"
-            "请处理:可直接修改 code/ 下对应脚本后回车重试;或输入 skip 跳过这些失败项继续。"
+            "请处理:可直接修改 code/ 下对应脚本后回车重试(会带着你的修改重跑,仍失败会再次询问);"
+            "或输入 skip 跳过这些失败项继续。"
         )
-        if "skip" in (feedback or "").strip().lower():
+        fb = (feedback or "").strip()
+        if "skip" in fb.lower():
             for rel, _, _ in failed:
                 reports.append({"file": rel, "status": "已由人工选择跳过"})
+            break
+        # 非 skip = 人工要求重试:本轮 resume 的重跑已在上方执行过;若仍失败则回到循环顶部再次询问
+        logger.info(f"人工未跳过(反馈: {fb[:50] or '(回车)'}),仍有 {len(failed)} 个失败脚本,继续人工介入")
 
     return {"run_report": reports}
 
@@ -677,7 +694,10 @@ def compare_summarize(state: over_all_state) -> dict:
             "1. 逐问对比四种方法的结论,标出结论一致与分歧之处;\n"
             "2. 结合代码运行情况(成功/失败/生成的图),说明结果可信度;\n"
             "3. 对每一问给出最可信的最终结论(可综合多种方法),并简要说明理由;\n"
-            "4. 整篇文档结构完整,可直接作为《最终总结》。"
+            "4. 整篇文档结构完整,可直接作为《最终总结》;\n"
+            "5. 对每一问明确标注:最终采用的方法(从四种中选定)+一句话理由+该问关键数值结果清单"
+            "(供论文撰写章节直接引用,数值必须与前述结论一致)。\n\n"
+            f"【中文写作规范(去 AI 味,务必严格遵循)】\n{read_writing_skill('de-AI')}"
         )
         resp = model_with_tool.invoke([HumanMessage(prompt)])
         to_append = [HumanMessage(prompt)]
@@ -701,12 +721,345 @@ def final_analysis(state:over_all_state) ->Command:
     )
     feedback=(feedback or '').strip()
     if not feedback or any(k in feedback for k in ('通过','认可')):
-        return Command(goto=END)
+        return Command(goto="write_article")
     return Command(goto='compare_summarize', update={
         'human_feedback': feedback,
         'compare_msgs': [RemoveMessage(id=m.id) for m in (state.get("compare_msgs") or []) if getattr(m, "id", None)],
     })
     
+
+# ============ 论文撰写节点：把最终结论/思路/图片填入 LaTeX 国赛模板的独立副本 ============
+# 输出目录：paper/latex/（独立副本，不污染原始 writter_struct 模板）
+LATEX_OUT = WORKSPACE_ROOT / "paper" / "latex"
+WRITER_TEMPLATE = WORKSPACE_ROOT / "writter_struct"
+# 模板里只复制一次、之后不再覆盖的静态文件（类文件/编译脚本/参考文献库等）
+LATEX_STATIC = ["cumcmthesis.cls", "book.bib", "build.bat", "clean.bat",
+                ".gitignore", "LICENSE", "README.md", "常用LaTex代码指令.txt", "document.tex"]
+
+# 各章节：(文件名, 写作要求)，文件名对应 writter_struct/texfile/<name>.tex
+ARTICLE_CHAPTERS = [
+    ("1abstract",
+     "摘要：300~600字，按 Nature 式'背景→问题→方法→结果→意义'证据链展开。首段简述背景与动机；"
+     "随后按'针对问题一/问题二/...'逐问成段，每段必须写明该问最终采用的方法（从解析法/数值模拟法/数据驱动法/"
+     "启发式优化法中选定的最适一种）、所用模型与关键定量结果（写具体数字，亮点突出）；末段写优化推广。"
+     "结尾用 \\keywords{关键词1\\quad 关键词2...}（3~5个，含模型名与方法名亮点）。只接受文字，不要图表。"),
+    ("2ProblemRestatement",
+     "问题重述：\\section{问题重述}，含 \\subsection{问题背景}（提炼原题，保持原意）与 "
+     "\\subsection{问题提出}（用 enumerate 列出各小问，基本原样复制题目所问）。篇幅不超一页。"),
+    ("3ProblemAnalysis",
+     "问题分析：\\section{问题分析}，对各小问分别 \\subsection{问题X分析} 写定性、数据洞察、建模思路，"
+     "对应 problem_index 的每个小问；并在每问分析末给出'本问拟采用的最适方法及一句话理由'"
+     "（从解析法/数值模拟法/数据驱动法/启发式优化法中选定，依据最终总结中的对比），为后文建模章节定主线。"),
+    ("4AssumptionAndSign",
+     "模型假设与符号说明：\\section{模型的假设} 用 enumerate 列 5 条左右合理假设；"
+     "\\section{符号说明} 用 booktabs 三线表（符号|说明）。"),
+    ("5MakeModel",
+     "模型的建立与求解：\\section{模型的建立与求解}。先写数据预处理，再逐问 "
+     "\\subsection{问题X的模型建立与求解}：先一句话声明'本问最终采用的方法及其理由'"
+     "（以最终总结中选定的最适方法为主线，其余方法至多一句话对比），再按 模型建立/求解/结果 三子节展开；"
+     "结果子节必须给出与最终总结一致的具体数值。可引用'可用图片'中与本问内容匹配的图"
+     "\\includegraphics{图片名.png}（graphicspath 已指向 texfile/figures/，直接写裸文件名即可，"
+     "不要加目录前缀）并配 \\caption/\\label（每问建议1~2张，图注要说明图中反映了什么结果）；"
+     "公式用 $...$ 或 equation 环境，关键公式必须完整可推导；所有数学命令（\\mathrm 等）只能出现在公式内，禁止在正文文本中使用。"),
+    ("6ErrorAnalysis",
+     "误差分析：\\section{误差分析}，逐问 \\subsection{针对问题X的误差分析} 说明结果检验与误差来源。"),
+    ("7ModelEvaluation",
+     "模型评价：\\section{模型的评价}，含 优点/缺点/推广 三 subsection，用 itemize 罗列。"),
+    ("8Reference",
+     "参考文献：用 thebibliography 环境（\\bibitem{ref01}...），按 GB/T 7714 风格列出正文中实际引用文献；"
+     "若用到了 AI 工具，按模板注释格式补充 AI 使用声明条目。"),
+    ("9Appendix",
+     "附录：\\appendix。\\section{详细图表} 索引；\\section{代码程序} 用 "
+     "\\lstinputlisting[style=Python, caption={...}]{code/文件名.py} 列出'求解代码文件'中每个 py；"
+     "\\section{支撑材料} 枚举。"),
+]
+
+
+def _ensure_latex_skeleton():
+    """首次把 writter_struct 模板静态文件复制到 paper/latex 独立副本；已存在则不覆盖。"""
+    LATEX_OUT.mkdir(parents=True, exist_ok=True)
+    for name in LATEX_STATIC:
+        src = WRITER_TEMPLATE / name
+        dst = LATEX_OUT / name
+        if src.exists() and not dst.exists():
+            shutil.copy(src, dst)
+    (LATEX_OUT / "texfile").mkdir(parents=True, exist_ok=True)
+    (LATEX_OUT / "texfile" / "figures").mkdir(parents=True, exist_ok=True)
+    (LATEX_OUT / "code").mkdir(parents=True, exist_ok=True)
+    # 复制模板自带的 code 示例，避免附录 \lstinputlisting 缺文件
+    tcode = WRITER_TEMPLATE / "code"
+    if tcode.is_dir():
+        for f in tcode.iterdir():
+            if f.is_file() and not (LATEX_OUT / "code" / f.name).exists():
+                shutil.copy(f, LATEX_OUT / "code" / f.name)
+
+
+def _strip_tex_fences(text: str) -> str:
+    """去掉 LLM 常包裹的 ```latex ... ``` 代码围栏，避免原样写进 .tex 导致编译失败。"""
+    s = (text or "").strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[^\n]*\n", "", s)
+        s = re.sub(r"\n```\s*$", "", s)
+    return s.strip()
+
+
+def _clean_latex_output():
+    """清空上一轮生成的章节/图片/代码，避免换题或重跑时残留旧产物。"""
+    for f in (LATEX_OUT / "texfile").glob("*.tex"):
+        f.unlink()
+    for d in ((LATEX_OUT / "texfile" / "figures"), (LATEX_OUT / "code")):
+        for f in d.glob("*"):
+            if f.is_file():
+                f.unlink()
+
+
+# ---------- LaTeX 编译验证与自愈：生成后真实编译，报错喂回 LLM 修复，循环到零错误 ----------
+LATEX_MAX_FIX = 3    # 编译报错后 LLM 自动修复的最大轮数
+LATEX_TIMEOUT = 180  # 单次 xelatex 编译超时(秒)
+
+
+def _find_xelatex():
+    """定位 xelatex：环境变量 MATH_XELATEX > PATH > C:/texlive/*/bin/windows/。找不到返回 None(跳过编译验证)。"""
+    cand = os.environ.get("MATH_XELATEX") or shutil.which("xelatex")
+    if cand:
+        return cand
+    for p in Path("C:/texlive").glob("*/bin/windows/xelatex.exe"):
+        return str(p)
+    return None
+
+
+def _run_xelatex(xe: str) -> str:
+    """在 LATEX_OUT 跑一遍 xelatex，返回 document.log 文本；先清理残留的 synctex 锁文件。"""
+    for busy in LATEX_OUT.glob("*.synctex(busy)"):
+        try:
+            busy.unlink()
+        except OSError:
+            pass
+    try:
+        subprocess.run(
+            [xe, "-interaction=nonstopmode", "document.tex"],
+            cwd=str(LATEX_OUT), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=LATEX_TIMEOUT,
+        )
+    except Exception as e:
+        return f"! xelatex 运行失败: {e}"
+    log_path = LATEX_OUT / "document.log"
+    return log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+
+
+def _extract_latex_errors(log: str) -> List[Dict[str, str]]:
+    """从 xelatex 日志提取 '!' 开头的错误块，并按日志中最近打开的 .tex 文件归属错误位置。"""
+    lines = log.splitlines()
+    opens = [(i, m.group(1)) for i, ln in enumerate(lines)
+             for m in re.finditer(r"[ (]\./(\S+\.tex)", ln)]
+    errors = []
+    for i, ln in enumerate(lines):
+        if not ln.startswith("!"):
+            continue
+        fname = ""
+        for oi, f in opens:
+            if oi <= i:
+                fname = f
+            else:
+                break
+        ctx = " | ".join(x.strip() for x in lines[i:i + 8] if x.strip())
+        errors.append({"file": fname, "msg": ctx[:600]})
+    return errors
+
+
+def _fix_latex_with_llm(errors: List[Dict[str, str]]) -> List[str]:
+    """把编译错误与相关章节文件内容交给 LLM 修复并写回，返回修复的文件名列表。"""
+    files = sorted({e["file"] for e in errors if e["file"].startswith("texfile/")})
+    if not files:
+        logger.warning(f"编译错误未能定位到章节文件: {[e['file'] for e in errors]}")
+        return []
+    parts = ["以下 CUMCM 论文的 LaTeX 章节编译报错，请修复。"]
+    for e in errors:
+        parts.append(f"[错误·{e['file']}] {e['msg']}")
+    for f in files:
+        path = LATEX_OUT / f
+        if path.exists():
+            parts.append(f"===== 文件 {f} 完整内容 =====\n" + path.read_text(encoding="utf-8", errors="replace"))
+    parts.append(
+        "修复要求：只修导致编译错误的语法问题（数学环境缺 $、数学命令用在文本模式、括号/环境不配对、"
+        "\\includegraphics 文件名错误、非法字符等），保持文字内容不变、不改写论述。\n"
+        "输出格式（可包含多个文件，除此之外不要任何解释文字）：\n"
+        "===FILE: texfile/文件名.tex===\n修复后的完整文件内容\n===END==="
+    )
+    try:
+        resp = model.invoke([HumanMessage("\n\n".join(parts))])
+    except Exception as e:
+        logger.error(f"LLM 修复编译错误调用失败: {e}")
+        return []
+    fixed = []
+    for m in re.finditer(r"===FILE:\s*(\S+)\s*===\n(.*?)\n?===END===", resp.content or "", re.S):
+        fname, content = m.group(1).strip(), m.group(2).strip()
+        if fname.startswith("texfile/") and content:
+            content = _strip_tex_fences(content)
+            (LATEX_OUT / fname).write_text(content + "\n", encoding="utf-8")
+            fixed.append(fname)
+    return fixed
+
+
+def write_article(state: over_all_state) -> dict:
+    logger.info("正在运行 write_article 节点：生成 LaTeX 论文到 paper/latex")
+    _ensure_latex_skeleton()
+    _clean_latex_output()
+
+    final_summary = state.get("final_summary") or "(无最终总结)"
+    approach = (state.get("modeling_approach") or state.get("modeling_analysis") or "(无思路)")
+    problem_str = state.get("problem_str") or ""
+    problem_index = state.get("problem_index") or {}
+    code_files = state.get("code_files") or []
+
+    # 1. 同步图片：photo/*.png -> paper/latex/texfile/figures/
+    figs = []
+    for img in PHOTO_DIR.glob("*.png"):
+        shutil.copy(img, LATEX_OUT / "texfile" / "figures" / img.name)
+        figs.append(img.name)
+    # 2. 同步求解代码：code/*.py -> paper/latex/code/（供附录 \lstinputlisting 引用）
+    for cf in code_files:
+        src = CODE_DIR / cf
+        if src.exists():
+            shutil.copy(src, LATEX_OUT / "code" / cf)
+
+    skill = read_writing_skill("de-AI")
+    done = []
+    for fname, req in ARTICLE_CHAPTERS:
+        prompt = (
+            "你是数学建模国赛论文撰写专家，请把以下内容写成符合 CUMCM LaTeX 模板的【单章节】LaTeX 源码。\n"
+            "【写作总则·务必遵循】\n"
+            "1. 叙事遵循 Nature 式'问题→方法→结果→讨论'证据链：每个论断尽量给出定量结果、公式或图引用作支撑，杜绝空话套话；\n"
+            "2. 方法主线：各小问以【最终结论】中选定的最适方法为主线展开（只写一种主线方法，其余方法至多一句话对比），"
+            "全文方法口径与最终总结保持一致；\n"
+            "3. 图表引用：仅引用文件名与本章内容明显匹配的图，用 \\includegraphics{裸文件名.png} "
+            "（graphicspath 已指向 texfile/figures/，禁止加目录前缀如 texfile/figures/ 或 figures/），"
+            "并为每张引用的图配 \\caption（说明图反映的结果），宁缺毋滥，禁止为凑数引用无关图片；\n"
+            "4. 数值一致性：文中所有关键数值必须与【最终结论】一致，不得自行编造或改写。\n"
+            "5. 公式规范：所有数学命令（如 \\mathrm、\\sum、\\frac）必须写在 $...$ 或 equation 环境内，"
+            "正文文本中严禁出现数学命令；公式前后括号配对完整，禁止缺 $。\n\n"
+            f"【本章要求】{req}\n\n"
+            f"【题目全文】{problem_str}\n\n"
+            f"【各小问题干】{problem_index}\n\n"
+            f"【建模思路】{approach}\n\n"
+            f"【最终结论（逐问）】{final_summary}\n\n"
+            f"【可用图片（位于 texfile/figures/）】{figs or '(无)'}\n"
+            f"【求解代码文件（位于 code/，供附录引用）】{code_files or '(无)'}\n\n"
+            f"【中文写作规范（去 AI 味，务必遵循）】\n{skill}\n\n"
+            "只输出该章节的完整 LaTeX 正文（不要 \\documentclass、不要 \\begin{document}、不要解释性文字、不要代码围栏），"
+            "直接可被 \\input 引用。"
+        )
+        target = LATEX_OUT / "texfile" / f"{fname}.tex"
+        try:
+            raw = model.invoke([HumanMessage(prompt)]).content
+            latex = _strip_tex_fences(raw)
+            if not latex:
+                raise ValueError("模型返回为空")
+            target.write_text(latex, encoding="utf-8")
+            done.append(fname)
+        except Exception as e:
+            logger.error(f"生成章节 {fname} 失败: {e}")
+            # 失败也写占位，保证 \\input 不报缺文件
+            target.write_text(f"% 本章（{fname}）生成失败：{e}\n", encoding="utf-8")
+            done.append(f"{fname}(失败:{e})")
+
+    # 3. 编译验证与自愈：真实编译一遍，有错误就把日志喂回 LLM 修复，直到零错误或用完修复轮数
+    xe = _find_xelatex()
+    compile_status = "未检测到 xelatex(可用环境变量 MATH_XELATEX 指定路径)，已跳过编译验证"
+    if xe:
+        logger.info(f"检测到 xelatex({xe})，开始论文编译验证与自愈")
+        log = _run_xelatex(xe)
+        errs = _extract_latex_errors(log)
+        ok = not errs and "Output written" in log
+        for rnd in range(1, LATEX_MAX_FIX + 1):
+            if ok:
+                break
+            logger.warning(f"[编译修复] 第 {rnd}/{LATEX_MAX_FIX} 轮：{len(errs)} 个错误，提交 LLM 修复")
+            if not _fix_latex_with_llm(errs):
+                break
+            log = _run_xelatex(xe)
+            errs = _extract_latex_errors(log)
+            ok = not errs and "Output written" in log
+        if ok:
+            _run_xelatex(xe)  # 再跑一遍稳定交叉引用/目录，出最终 PDF
+            compile_status = "编译通过(0 错误)，已生成 paper/latex/document.pdf"
+        else:
+            compile_status = (f"仍有 {len(errs)} 个编译错误(已尝试 {LATEX_MAX_FIX} 轮 LLM 修复)，"
+                              f"请人工查看 paper/latex/document.log")
+        logger.info(f"论文编译验证结果：{compile_status}")
+
+    return {"article_chapters": done,
+            "compile_status": compile_status,
+            "messages": [AIMessage(content="已生成 LaTeX 论文章节：" + "、".join(done) + f"；{compile_status}")]}
+
+
+# 回填 document.tex 封面元信息：标题由 LLM 自动生成，题号/报名号/学校/年份由人工 interrupt 提供
+def fill_document_meta(state: over_all_state) -> dict:
+    logger.info("正在运行 fill_document_meta 节点：回填 document.tex 元信息")
+    doc_path = LATEX_OUT / "document.tex"
+    if not doc_path.exists():
+        return {"messages": [AIMessage(content="document.tex 不存在，跳过元信息回填")]}
+
+    # 1) 索取需人工确定的元信息（留空=保持模板默认/注释）
+    meta = interrupt(
+        "请填写论文封面元信息（每行一项，回车留空则保持模板默认）：\n"
+        "第1行 题号(如 A/B/C/D)\n"
+        "第2行 报名号\n"
+        "第3行 学校名称\n"
+        "第4行 年份(如 2025)\n"
+        "直接回车=全部用模板默认"
+    )
+    lines = (meta or "").splitlines()
+    tihao = lines[0].strip() if len(lines) > 0 else ""
+    baoming = lines[1].strip() if len(lines) > 1 else ""
+    school = lines[2].strip() if len(lines) > 2 else ""
+    year = lines[3].strip() if len(lines) > 3 else ""
+
+    text = doc_path.read_text(encoding="utf-8")
+
+    # 2) 自动生成标题（基于题目）
+    try:
+        title_prompt = (
+            "请用一句话(中文,不超过30字)概括以下数学建模题目的论文标题，"
+            "要求准确、学术、体现核心方法或对象，不要带书名号。只输出标题本身。\n"
+            f"题目：{state.get('problem_str') or ''}"
+        )
+        new_title = model.invoke([HumanMessage(title_prompt)]).content.strip().strip("《》").strip()
+    except Exception as e:
+        logger.warning(f"生成标题失败: {e}")
+        new_title = ""
+    if new_title:
+        # 注意:re.sub 的替换字符串会解析 \t \b \s 等转义,直接传 f"\\title{...}" 会把反斜杠吞掉
+        # (\t→制表符)甚至抛 re.error。必须用 lambda 返回字面值,避免转义处理。
+        text = re.sub(r"\\title\{[^}]*\}", lambda _: f"\\title{{{new_title}}}", text)
+
+    # 3) 回填人工字段（提供则取消注释并填值，保留行尾 %注释；%? 兼容已启用过的行，保证可重复更新）
+    if tihao:
+        text = re.sub(r"%?\s*\\tihao\{[^}]*\}", lambda _: f"\\tihao{{{tihao}}}", text, count=1)
+    if baoming:
+        text = re.sub(r"%?\s*\\baominghao\{[^}]*\}", lambda _: f"\\baominghao{{{baoming}}}", text, count=1)
+    if school:
+        text = re.sub(r"%?\s*\\schoolname\{[^}]*\}", lambda _: f"\\schoolname{{{school}}}", text, count=1)
+    if year:
+        text = re.sub(r"%?\s*\\yearinput\{[^}]*\}", lambda _: f"\\yearinput{{{year}}}", text, count=1)
+
+    doc_path.write_text(text, encoding="utf-8")
+
+    # 4) 元信息回填后重新编译，保证最终 PDF 包含封面字段(找不到 xelatex 则跳过)
+    xe = _find_xelatex()
+    final_build = ""
+    if xe:
+        log = _run_xelatex(xe)
+        errs = _extract_latex_errors(log)
+        if not errs:
+            errs = _extract_latex_errors(_run_xelatex(xe))  # 第二遍稳定引用
+        final_build = ("；最终编译通过，PDF 已更新" if not errs
+                       else f"；最终编译仍有 {len(errs)} 个错误，请查看 document.log")
+
+    return {"messages": [AIMessage(
+        content=f"已回填元信息：题号={tihao or '默认'} 报名号={baoming or '默认'} "
+                f"学校={school or '默认'} 年份={year or '默认'} 标题={new_title or '默认'}{final_build}")]}
+
 
 #测试时建立检查点暂时用内存存储
 checkpointer=InMemorySaver()
@@ -737,6 +1090,10 @@ builder.add_node('run_solutions',run_solutions)
 builder.add_node('compare_summarize',compare_summarize)
 builder.add_node('compare_tool_node',ToolNode(tools=tools, messages_key="compare_msgs"))
 builder.add_node('final_analysis', final_analysis)
+builder.add_node('write_article', write_article)
+builder.add_node('fill_document_meta', fill_document_meta)
+builder.add_edge("write_article", "fill_document_meta")
+builder.add_edge("fill_document_meta", END)
 
 builder.add_edge(START, 'load_problem')  
 builder.add_edge('load_problem', 'question_structed') 

@@ -188,10 +188,10 @@ export default function App() {
     return () => el.removeEventListener("wheel", onWheel);
   }, [zoomImage]);
 
-  // 当前选中模型是否已具备可用的 key（环境已配置 或 已保存）
+  // 当前选中模型是否已具备可用的 key：统一以 .env（进程环境）是否就绪为准
   const currentModel = models.find((m) => m.key === selectedModel);
   const currentEnv = currentModel?.api_key_env;
-  const keyReady = Boolean(currentEnv && (currentModel?.key_set || savedKeys[currentEnv]));
+  const keyReady = Boolean(currentEnv && currentModel?.key_set);
   const missingCount = models.filter(
     (m) => m.api_key_env && !(m.key_set || savedKeys[m.api_key_env]),
   ).length;
@@ -271,9 +271,10 @@ export default function App() {
     setFinalSummary("");
     setRunReports([]);
     setSelected(null);
-    const runKey = currentEnv && savedKeys[currentEnv] ? savedKeys[currentEnv] : undefined;
+    // 配置统一来源于 .env，环境已就绪则无需前端下发 key，后端自读；否则兜底用已保存值
+    const runKey = currentModel?.key_set ? undefined : (savedKeys[currentEnv] || undefined);
     run(null, selectedModel, runKey);
-  }, [status, run, selectedModel, currentEnv, savedKeys]);
+  }, [status, run, selectedModel, currentEnv, currentModel, savedKeys]);
 
   const onSubmitAnswer = useCallback(() => {
     if (status !== "awaiting_input") return;
@@ -281,9 +282,9 @@ export default function App() {
     push({ kind: "user", label: "人工输入", content: text || "（回车跳过）" });
     setAnswer("");
     setQuestion(null);
-    const runKey = currentEnv && savedKeys[currentEnv] ? savedKeys[currentEnv] : undefined;
+    const runKey = currentModel?.key_set ? undefined : (savedKeys[currentEnv] || undefined);
     run(text, selectedModel, runKey);
-  }, [status, answer, run, push, selectedModel, currentEnv, savedKeys]);
+  }, [status, answer, run, push, selectedModel, currentEnv, currentModel, savedKeys]);
 
   const onSaveKeys = useCallback(async () => {
     setSavingKeys(true);

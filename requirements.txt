@@ -21,6 +21,10 @@ pandas==3.0.2
 python-dotenv==1.2.1
 loguru==0.7.3
 
+# ---- skill 依赖(画图等示例 skill 需要) ----
+matplotlib>=3.8
+numpy>=1.26
+
 # ---- 后端展示接口 ----
 fastapi==0.135.1
 uvicorn==0.46.0

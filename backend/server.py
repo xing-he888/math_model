@@ -20,6 +20,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional, Dict
+from dotenv import load_dotenv, set_key
 
 # agent 使用 ./question ./dataset 等相对 CWD 的路径, 必须切到项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -42,6 +43,7 @@ DEFAULT_PORT = int(os.environ.get("MATH_BACKEND_PORT", "8000"))
 
 # ---------- 模型选择持久化（配置一次一直可用，类似 opencode 的配置文件） ----------
 CONFIG_PATH = PROJECT_ROOT / "model_config.json"
+ENV_PATH = PROJECT_ROOT / ".env"
 
 def _load_config() -> dict:
     try:
@@ -54,12 +56,10 @@ def _load_config() -> dict:
 def _load_model_config() -> str:
     return _load_config().get("model", "deepseek")
 
-def _save_config(model: str, keys: dict | None = None) -> None:
+def _save_config(model: str) -> None:
     cfg = _load_config()
     cfg["model"] = model
-    if keys:
-        cfg.setdefault("keys", {})
-        cfg["keys"].update({k: v for k, v in keys.items() if v})
+    cfg.pop("keys", None)  # 密钥统一存于 .env，不再写入 model_config.json（避免进入版本库）
     try:
         CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
@@ -221,57 +221,52 @@ async def get_models():
 
 @app.get("/api/model")
 async def get_model_config():
-    """返回当前已保存的默认模型与已保存的 key"""
+    """返回当前已保存的默认模型；密钥统一从 .env 读取，这里不再返回明文"""
     _cfg = _load_config()
     return {
         "model": _cfg.get("model", "deepseek"),
-        "keys": _cfg.get("keys", {}),
+        "keys": {},
     }
 
 @app.post("/api/model")
 async def set_model_config(body: ModelName):
-    """保存默认模型（持久化），可选附带 API Key，并立即切换"""
+    """保存默认模型（持久化），可选附带 API Key（写入 .env，与系统环境变量同源）"""
     name = (body.model or "deepseek").strip().lower()
     if name not in MODEL_REGISTRY:
         raise HTTPException(400, f"未知模型: {name}（可用: {', '.join(MODEL_REGISTRY.keys())}）")
-    keys = None
     if body.api_key:
         _env = MODEL_REGISTRY[name]["api_key_env"]
-        os.environ[_env] = body.api_key
-        keys = {_env: body.api_key}
+        set_key(str(ENV_PATH), _env, body.api_key.strip())
+        os.environ[_env] = body.api_key.strip()
     try:
         set_model(name)
     except Exception as e:
         raise HTTPException(400, f"切换模型失败: {e}")
-    _save_config(name, keys)
+    _save_config(name)
     return {"model": name, "status": "saved"}
 
 @app.post("/api/keys")
 async def save_keys(body: KeysBody):
-    """批量保存 API Key（持久化到 model_config.json），可选同时设定默认模型；不影响本次运行。
-    已存在于系统环境 / .env 的 key 无需重复提交，只提交缺失项即可。"""
-    cfg = _load_config()
-    cfg.setdefault("keys", {})
-    applied = {}
+    """批量保存 API Key：直接写入 .env（前端配置落盘到 .env，与系统环境变量同源），
+    不写入 model_config.json，避免密钥进入版本库。已存在于系统环境 / .env 的 key 无需重复提交。"""
     for env_name, val in (body.keys or {}).items():
         if val and val.strip():
+            set_key(str(ENV_PATH), env_name, val.strip())
             os.environ[env_name] = val.strip()
-            cfg["keys"][env_name] = val.strip()
-            applied[env_name] = val.strip()
     if body.model:
         name = body.model.strip().lower()
         if name in MODEL_REGISTRY:
             try:
                 set_model(name)
-                cfg["model"] = name
             except Exception as e:
                 logger.warning(f"切换默认模型失败（沿用当前）: {e}")
+    # 仅默认模型持久化到 model_config.json（不再存密钥）
     try:
-        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        _save_config((body.model or _load_config().get("model", "deepseek")).strip().lower())
     except Exception as e:
-        logger.warning(f"保存配置失败: {e}")
-    present = {env_name: bool(os.getenv(env_name)) for env_name in set(cfg["keys"].keys()) | {m["api_key_env"] for m in MODEL_REGISTRY.values()}}
-    return {"model": cfg.get("model", "deepseek"), "keys": cfg.get("keys", {}), "present": present}
+        logger.warning(f"保存默认模型失败: {e}")
+    present = {m["api_key_env"]: bool(os.getenv(m["api_key_env"])) for m in MODEL_REGISTRY.values()}
+    return {"model": _load_config().get("model", "deepseek"), "keys": {}, "present": present}
 
 @app.get("/api/health")
 async def health():
