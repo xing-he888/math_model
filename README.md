@@ -46,4 +46,4 @@ npm start
 
 
 
-## 此项目暂时使用deepseek的api，后续会加入其他ai
+## 此项目有DeepSeek/GPT (OpenAI)/GLM (智谱 Zhipu)/通义千问 (Qwen)/Kimi (Moonshot)/MiniMax (Mimo)
