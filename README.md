@@ -14,7 +14,6 @@ frontend/   Electron 桌面端，实时展示
 ```
 
 ```powershell
-conda activate langgraph
 python backend\server.py
 ```
 
@@ -40,7 +39,7 @@ npm start
 
 ## 常见问题
 
-- 后端起不来：确认用的是 `langgraph` 环境的 python，且在根目录执行
+- 后端起不来：请确认后端以来是否正常
 - 前端显示后端离线：后端没起，或 8000 端口被占
 - 出图脚本执行：`run_solutions` 只跑含 `savefig`/`matplotlib` 的脚本；单个脚本失败会重试 2 次，仍失败则提交 LLM 诊断并改写代码（最多 2 轮），全部失败才中断交由人工处理。
 
