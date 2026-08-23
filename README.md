@@ -47,3 +47,7 @@ npm start
 
 
 ## 此项目有DeepSeek/GPT (OpenAI)/GLM (智谱 Zhipu)/通义千问 (Qwen)/Kimi (Moonshot)/MiniMax (Mimo)
+
+## 需要本机下载texlive才可正常生成论文
+
+## 目前只支持每道题的手动操作，题目运行完需手动清理缓存，后续会加入自动管理运行数据
