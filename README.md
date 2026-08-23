@@ -13,6 +13,7 @@ backend/    FastAPI + SSE 流式接口
 frontend/   Electron 桌面端，实时展示
 ```
 
+启动后端
 ```powershell
 python backend\server.py
 ```
