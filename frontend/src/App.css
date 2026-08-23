@@ -1,6 +1,6 @@
 /* ============================================================
-   数学建模 Agent 控制台 · 极简蓝白科技风（浅色主题）
-   白底 + 蓝色点缀 + 玻璃卡片 + 细网格底纹
+   数学建模 Agent 控制台 · 液态玻璃风（浅色主题）
+   背景图铺满 + 蓝色点缀 + 液态玻璃组件（背景透出）
    ============================================================ */
 
 :root {
@@ -8,9 +8,14 @@
   --bg: #eef2f9;
   --bg-glow-1: rgba(59, 130, 246, 0.1);
   --bg-glow-2: rgba(37, 99, 235, 0.06);
-  --glass: rgba(255, 255, 255, 0.72);
-  --glass-strong: rgba(255, 255, 255, 0.88);
-  --glass-input: #ffffff;
+  --glass: rgba(255, 255, 255, 0.04);
+  --glass-strong: rgba(255, 255, 255, 0.08);
+  --glass-input: rgba(255, 255, 255, 0.20);
+  /* 液态玻璃：如水般透亮——极低白度，靠高光边界定面板 */
+  --glass-border: rgba(255, 255, 255, 0.55);
+  --glass-shadow: 0 8px 30px rgba(15, 40, 105, 0.14),
+    inset 0 1px 0 rgba(255, 255, 255, 0.5);
+  --glass-blur: blur(5px) saturate(175%);
   --line: #dde5f1;
   --line-bright: #aebfe0;
 
@@ -54,23 +59,37 @@ body {
   overflow: hidden;
 }
 
-.app::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 0;
-  background-image:
-    linear-gradient(rgba(37, 64, 143, 0.05) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(37, 64, 143, 0.05) 1px, transparent 1px);
-  background-size: 44px 44px;
-  mask-image: radial-gradient(ellipse at center, black 30%, transparent 78%);
-  -webkit-mask-image: radial-gradient(ellipse at center, black 30%, transparent 78%);
-}
+/* 液态玻璃下移除网格叠加，避免与背景图冲突 */
 
 .app > * {
   position: relative;
   z-index: 1;
+}
+
+/* ---------- 背景图 ----------
+   铺满视口，居中、不重复、按比例裁剪。
+   cover 保证任何窗口尺寸都填满、无白边；
+   center 保证主体始终居中、不会错乱；
+   fixed 让背景相对视口锁定，缩放窗口自动重算。 */
+.app-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  background-color: var(--bg);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+  filter: saturate(140%) contrast(104%) brightness(102%);
+}
+
+/* 暗角渐变：仅四周轻微压暗，中央尽量透明，背景图主导视觉 */
+.app-bg::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(ellipse at 50% 42%, transparent 74%, rgba(18, 32, 56, 0.08) 100%);
 }
 
 .app {
@@ -107,10 +126,10 @@ body {
   gap: 12px;
   padding: 10px 18px;
   background: var(--glass-strong);
-  backdrop-filter: blur(18px);
-  -webkit-backdrop-filter: blur(18px);
-  border-bottom: 1px solid var(--line);
-  box-shadow: 0 4px 24px rgba(15, 40, 105, 0.06);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border-bottom: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
 }
 
 .brand {
@@ -181,9 +200,11 @@ body {
   font-size: 12px;
   padding: 4px 12px;
   border-radius: 999px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--glass-border);
   color: var(--muted);
-  background: rgba(255, 255, 255, 0.6);
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(6px) saturate(150%);
+  -webkit-backdrop-filter: blur(6px) saturate(150%);
   transition: all 0.25s ease;
 }
 
@@ -256,12 +277,15 @@ body {
 
 .btn {
   padding: 7px 16px;
-  border-radius: 9px;
-  border: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.6);
+  border-radius: 12px;
+  border: 1px solid var(--glass-border);
+  background: rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(5px) saturate(160%);
+  -webkit-backdrop-filter: blur(5px) saturate(160%);
   color: var(--text);
   cursor: pointer;
   font-size: 13px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
   transition: all 0.2s ease;
 }
 
@@ -307,17 +331,15 @@ body {
 
 .panel {
   background: var(--glass);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid var(--line);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
   border-radius: 14px;
   display: flex;
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
-  box-shadow:
-    0 12px 36px rgba(15, 40, 105, 0.08),
-    inset 0 1px 0 rgba(255, 255, 255, 0.7);
+  box-shadow: var(--glass-shadow);
 }
 
 .panel h2 {
@@ -371,7 +393,9 @@ body {
   border-radius: 8px;
   font-size: 12px;
   border-left: 2px solid transparent;
-  background: rgba(255, 255, 255, 0.5);
+  background: rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(4px) saturate(150%);
+  -webkit-backdrop-filter: blur(4px) saturate(150%);
   margin-bottom: 4px;
   animation: slide-in 0.22s ease both;
 }
@@ -427,7 +451,7 @@ body {
 .log-label {
   font-weight: 600;
   white-space: nowrap;
-  color: var(--info);
+  color: var(--text);
 }
 
 .log-item.error .log-label {
@@ -435,7 +459,7 @@ body {
 }
 
 .log-item.user .log-label {
-  color: var(--c-cyan);
+  color: var(--text);
 }
 
 .log-content {
@@ -473,18 +497,16 @@ body {
 .summary-box h1,
 .summary-box h2,
 .summary-box h3 {
-  background: var(--grad);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  color: #0C447C;
 }
 
 .summary-box code {
-  background: rgba(37, 99, 235, 0.1);
+  background: rgba(15, 40, 105, 0.08);
   padding: 1px 6px;
   border-radius: 4px;
   font-family: "Cascadia Code", Consolas, monospace;
   font-size: 12px;
+  color: var(--text);
 }
 
 .summary-box pre {
@@ -512,11 +534,13 @@ body {
 
 .report-item {
   padding: 10px 12px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--glass-border);
   border-radius: 10px;
   margin-bottom: 8px;
   font-size: 12px;
-  background: rgba(255, 255, 255, 0.6);
+  background: rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(4px) saturate(150%);
+  -webkit-backdrop-filter: blur(4px) saturate(150%);
   transition: border-color 0.2s;
 }
 
@@ -641,18 +665,16 @@ body {
 .md-preview h1,
 .md-preview h2,
 .md-preview h3 {
-  background: var(--grad);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  color: #0C447C;
 }
 
 .md-preview code {
-  background: rgba(37, 99, 235, 0.1);
+  background: rgba(15, 40, 105, 0.08);
   padding: 1px 6px;
   border-radius: 4px;
   font-family: "Cascadia Code", Consolas, monospace;
   font-size: 12px;
+  color: var(--text);
 }
 
 .md-preview pre {
@@ -713,10 +735,12 @@ body {
 
 .img-item {
   margin: 0;
-  border: 1px solid var(--line);
+  border: 1px solid var(--glass-border);
   border-radius: 11px;
   overflow: hidden;
-  background: #fff;
+  background: rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
   transition: all 0.22s ease;
 }
 
@@ -818,10 +842,11 @@ body {
 
 /* ---------- footer ---------- */
 .footer {
-  border-top: 1px solid var(--line);
+  border-top: 1px solid var(--glass-border);
   background: var(--glass-strong);
-  backdrop-filter: blur(18px);
-  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow);
   padding: 11px 18px;
 }
 
@@ -893,16 +918,16 @@ body {
   max-width: 92vw;
   max-height: 86vh;
   overflow-y: auto;
-  background: var(--glass-strong);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border: 1px solid var(--line-bright);
+  background: rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(12px) saturate(175%);
+  -webkit-backdrop-filter: blur(12px) saturate(175%);
+  border: 1px solid var(--glass-border);
   border-radius: 16px;
   padding: 20px 22px 18px;
   box-shadow:
-    0 24px 64px rgba(15, 40, 105, 0.2),
-    0 0 40px rgba(37, 99, 235, 0.08),
-    inset 0 1px 0 rgba(255, 255, 255, 0.7);
+    0 24px 64px rgba(15, 40, 105, 0.25),
+    0 0 40px rgba(37, 99, 235, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.6);
   animation: modal-pop 0.2s cubic-bezier(0.34, 1.4, 0.64, 1);
 }
 

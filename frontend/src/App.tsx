@@ -18,6 +18,7 @@ import {
   type ModelOption,
 } from "./api";
 import "./App.css";
+import bgImage from "./assets/bg-miku.jpg";
 
 const NODE_LABELS: Record<string, string> = {
   load_problem: "读取题目",
@@ -335,6 +336,7 @@ export default function App() {
 
   return (
     <div className="app">
+      <div className="app-bg" style={{ backgroundImage: `url(${bgImage})` }} />
       <header className="header">
         <div className="brand">
           <h1>数学建模 Agent 控制台</h1>
