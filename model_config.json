@@ -1,4 +1,3 @@
 {
-  "model": "deepseek",
-  "keys": {}
+  "model": "glm"
 }

@@ -15,11 +15,11 @@ from langchain_core.messages import HumanMessage,AIMessage, SystemMessage, ToolM
 from dotenv import  load_dotenv
 from langgraph.prebuilt import ToolNode
 from langchain_core.tools import tool
-from models import get_model, list_models, MODEL_REGISTRY, DEFAULT_MODEL
+from models import get_model, get_struct_model, list_models, MODEL_REGISTRY, DEFAULT_MODEL
 from pypdf import PdfReader
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Send
-from tool import tools as base_tools, write_workspace, WORKSPACE_ROOT
+from tool import tools as base_tools, write_workspace, WORKSPACE_ROOT, set_workspace, get_workspace, ws_root
 from src.skills import load_skill_tools
 from src.skills.writing import read_writing_skill
 
@@ -30,6 +30,7 @@ TOOLS_BY_NAME = {t.name: t for t in tools}
 import pandas as pd
 import json
 import re
+import time
 import operator
 import subprocess
 import shutil
@@ -41,24 +42,105 @@ load_dotenv(override=True)
 # ---------- 模型（可配置：从注册表选择，支持 deepseek/gpt/glm/qwen/kimi/mimo） ----------
 # 通过环境变量 MATH_MODEL 选择要用的模型，例如 deepseek / gpt / glm / qwen / kimi / mimo
 # 新增模型：在 src/models.py 的 MODEL_REGISTRY 里加一项即可，无需改这里。
-model = get_model()
-model_with_tool=model.bind_tools(tools=tools)
+# ---------- 双实例：干活(不思考) vs 动脑(可思考) ----------
+# 背景: DeepSeek V4 默认思考模式, 且思考模式下拒绝 tool_choice="required"/指定函数名(HTTP 400),
+# 因此工具循环必须用不思考实例; 其余节点(建模分析、诊断、论文写作等)默认走可思考实例。
+# 注意: 结构化输出(格式化)步骤不在此列——它们固定走 DeepSeek 非思考专用实例(见 struct_model),
+# 不随 set_model 切换, 因为强制思考模型会拒绝 with_structured_output 的强制 tool_choice。
+model_tool = get_model(role="tool")
+model_text = get_model(role="text")
+model = model_tool                      # 旧变量名保留, 指向非思考实例(worker 兜底/标题生成等)
+model_with_tool=model_tool.bind_tools(tools=tools)
+model_think_tool=model_text.bind_tools(tools=tools)
 tool_node=ToolNode(tools=tools)
 
-# 运行时动态切换全局模型（前端/API 可调用），无需重启进程
+# 当前生效模型的显示名(按角色),供日志打印"本次调用用了哪个模型";
+# tool/text 随 set_model 更新,struct(格式化)固定 deepseek 不随切换变化
+MODEL_NAMES = {"tool": DEFAULT_MODEL, "text": DEFAULT_MODEL, "struct": "deepseek"}
+
+def _llm_role(m) -> str:
+    """按实例身份推断角色: text(思考)/struct(格式化固定)/其余归 tool(干活)。
+    注意 with_structured_output/bind_tools 都会生成新包装对象,须逐一身份比对。"""
+    if m is model_text or m is model_think_tool:
+        return "text"
+    if m is struct_model or m is model_with_struct or m is model_feedback_struct:
+        return "struct"
+    return "tool"
+
+def _log_llm(m, action: str = "") -> None:
+    role = _llm_role(m)
+    suffix = f" · {action}" if action else ""
+    logger.info(f"LLM调用 → {MODEL_NAMES.get(role, '?')}[{role}]{suffix}")
+
+def _invoke_llm(model_obj, msgs, action: str = "", retries: int = 2):
+    """模型调用带降级 + 重试：
+    ① 思考实例被 API 以 400/tool_choice/thinking 拒绝 → 确定性错误，立即降级为
+       非思考实例（降级实例递归复用本函数，享受同样的日志与重试；因身份检查只对
+       思考实例成立，递归深度最多 1 层，必然终止）；
+    ② 401/403 鉴权错误 → 重试无意义，快速抛出；
+    ③ 其余瞬时错误（429 限流/超时/5xx/连接重置等）→ 退避 2s/4s 重试 retries 次，
+       仍失败原样抛出。
+    注意用 id 严格判断实例身份——建模节点超限路径传入的 tool_choice="none" 实例
+    绝不允许被降级替换，否则会重新放开工具调用、破坏防死循环保证。
+    sync 节点由 langgraph 放在线程池 executor 执行，重试里的 sleep 只阻塞本分支
+    线程，不影响事件循环、SSE 流与其它并行分支。"""
+    _log_llm(model_obj, action)
+    for attempt in range(retries + 1):
+        try:
+            return model_obj.invoke(msgs)
+        except Exception as e:
+            msg = str(e)
+            # ① 思考模式被拒：确定性错误，直接降级换实例
+            if any(model_obj is m for m in (model_text, model_think_tool)) and (
+                "400" in msg or "tool_choice" in msg.lower() or "thinking" in msg.lower()
+            ):
+                logger.warning(f"思考模式调用被拒({e})，自动降级为非思考实例重试")
+                return _invoke_llm(model_with_tool, msgs, action, retries)
+            # ② 鉴权错误：重试无意义
+            if "401" in msg or "403" in msg:
+                raise
+            # ③ 瞬时故障：退避重试
+            if attempt < retries:
+                logger.warning(f"LLM 瞬时故障({e})，{2 * (attempt + 1)}s 后重试({attempt + 2}/{retries + 1})")
+                time.sleep(2 * (attempt + 1))
+            else:
+                raise
+
+# 运行时动态切换全局模型（前端/API 可调用），无需重启进程。
+# 只重设思考/干活两套实例及其派生; struct_model(格式化专用)固定 DeepSeek, 刻意不重建。
 def set_model(name: str = None) -> str:
-    """重设 model / model_with_tool / model_with_struct 三个全局对象，返回实际生效的 key。"""
-    global model, model_with_tool, model_with_struct
+    """重设全部可切换的模型全局对象，返回实际生效的 key。"""
+    global model, model_tool, model_text, model_with_tool, model_think_tool
     key = (name or os.getenv("MATH_MODEL", DEFAULT_MODEL)).strip().lower()
     if key not in MODEL_REGISTRY:
         key = DEFAULT_MODEL
-    model = get_model(key)
-    model_with_tool = model.bind_tools(tools=tools)
-    model_with_struct = model.with_structured_output(schema=structed_output_state)
+    model_tool = get_model(key, role="tool")
+    model_text = get_model(key, role="text")
+    model = model_tool
+    model_with_tool = model_tool.bind_tools(tools=tools)
+    model_think_tool = model_text.bind_tools(tools=tools)
+    MODEL_NAMES["tool"] = MODEL_NAMES["text"] = key
     return key
 
-question_path='./question'
-dataset_path='./dataset'
+# 题目输入输出目录：随当前题目工作区（workspaces/{题目id}/）动态解析，多题互不干扰
+def question_dir() -> Path:
+    return ws_root() / "question"
+
+def dataset_dir() -> Path:
+    return ws_root() / "dataset"
+
+# redo 清场哨兵:operator.add 下空列表清不掉旧值(旧值+[]=旧值),必须用自定义 reducer 识别 RESET 强制归零
+# 注意:langgraph 1.2.x 的 InMemorySaver 会把 channel 写入 msgpack 序列化后存检查点,
+# object() 哨兵不可序列化会直接 TypeError;必须用可序列化的字符串哨兵。
+# 且 resume 重放时写入值经"序列化→反序列化"往返,回来的是值相等的新对象,
+# 因此 reducer 里只能用 == 比较而不能用 is。
+RESET = "__RESET__"
+
+def add_or_reset(left: list, right) -> list:
+    """可重置的追加 reducer:收到 RESET 哨兵时清空,否则按 operator.add 追加"""
+    if right == RESET:
+        return []
+    return left + (right or [])
 
 #全局状态
 class over_all_state(MessagesState):
@@ -75,30 +157,110 @@ class over_all_state(MessagesState):
     human_feedback: Annotated[str, '人工对最终总结的意见'] = ''
     method: Annotated[str, 'worker方法身份'] = ''
     dataset_files: Annotated[str, '数据集文件名清单'] = ''
-    answers: Annotated[List[Dict[str, str]], operator.add] = []
-    code_files: Annotated[List[str], operator.add] = []
+    answers: Annotated[List[Dict[str, str]], add_or_reset] = []
+    code_files: Annotated[List[str], add_or_reset] = []
     run_report: List[Dict[str, str]] = []
-    failed_qs: Annotated[List[str], operator.add] = []
-    done_pairs: Annotated[List[str], operator.add] = []
+    failed_qs: Annotated[List[str], add_or_reset] = []
+    done_pairs: Annotated[List[str], add_or_reset] = []
     # 注意:必须用 add_messages 而非 operator.add——final_analysis 打回时会写入 RemoveMessage 删除指令,
     # 只有 add_messages 能消化它;operator.add 会把指令本身拼进列表,后续 invoke 模型时抛 TypeError
     compare_msgs: Annotated[List, add_messages] = []
     final_summary: Annotated[str, '最终总结'] = ''
     article_chapters: Annotated[List[str], '已生成的论文章节'] = []
     compile_status: Annotated[str, '论文编译验证状态'] = ''
+    model_iteration: Annotated[int, '建模迭代次数(feedback_check 打回计数)'] = 0
+    feedback_notes: Annotated[List[str], add_or_reset] = []  # 上轮质检失败原因,modeling 节点据此修正思路
 
 #定义格式化的状态，仅开始时使用
 class structed_output_state(TypedDict):
     problem_str:Annotated[str,'问题题干']
     problem_index:Annotated[Dict[str, str], "问题索引字典"]
 
-model_with_struct=model.with_structured_output(schema=structed_output_state)
+# ---------- 格式化专用实例：固定 DeepSeek 非思考，不随前端切换模型变化 ----------
+# with_structured_output 内部会发强制 tool_choice，强制思考模型(如 OpenRouter 接入的
+# reasoning 模型)会 HTTP 400 拒绝; 问题提取/质检这类格式化步骤钉死 DeepSeek,
+# 前端切换的模型只影响其余思考型调用。需在 .env 配置 DEEPSEEK_API_KEY(前端已注明)。
+struct_model = get_struct_model()
+model_with_struct = struct_model.with_structured_output(schema=structed_output_state)
+
+# feedback_check 质检节点的裁决结构(同样走固定格式化实例)
+class FeedbackVerdict(TypedDict):
+    passed: Annotated[bool, '建模方案与求解结果是否通过质检']
+    reason: Annotated[str, '不通过时的具体原因']
+    suggestion: Annotated[str, '打回重做时给建模手的修正建议']
+
+model_feedback_struct = struct_model.with_structured_output(schema=FeedbackVerdict)
+
+#质检节点:求解结果汇总后、汇合前,用结构化输出判断建模方案是否可信
+#不通过则打回 modeling 重做(清空 operator.add 系字段防止污染),最多迭代 3 次强制放行
+def feedback_check(state: over_all_state):
+    logger.info('正在运行 feedback_check 节点')
+    iteration = state.get("model_iteration", 0)
+    answers = state.get("answers") or []
+
+    # 无解或迭代达上限:直接放行,防死循环
+    if not answers or iteration >= 3:
+        if iteration >= 3:
+            logger.warning('建模迭代已达 3 次上限，强制放行进入后续流程')
+        # 放行时同步清残留,避免旧质检状态污染后续轮次
+        return Command(goto="collect_branches", update={"feedback_notes": RESET, "model_iteration": 0})
+
+    problem_str = state["problem_str"]
+    analysis = state.get("modeling_analysis") or ""
+    brief = "\n".join(
+        f"- 问题{a.get('question', '?')}: {str(a.get('answer', ''))[:500]}"
+        for a in answers[:10]
+    )
+    failed = state.get("failed_qs") or []
+    failed_str = "；".join(failed) if failed else "无"
+
+    prompt = (
+        "你是数学建模质检员。下面是建模方案与各小问的求解结果摘要，请判断方案与结果是否可信、自洽。\n"
+        f"【题目】{problem_str}\n"
+        f"【建模思路】{analysis}\n"
+        f"【失败的小问】{failed_str}\n"
+        f"【求解结果摘要】\n{brief}\n\n"
+        "判定标准：结果明显矛盾、大量小问失败、模型与题意不符才算不通过；结论合理即可通过。"
+    )
+    try:
+        verdict = _invoke_llm(model_feedback_struct, prompt, action="建模质检")
+    except Exception as e:
+        logger.warning(f'feedback_check 质检调用失败，默认放行: {e}')
+        return Command(goto="collect_branches", update={"feedback_notes": RESET, "model_iteration": 0})
+
+    passed = bool(verdict.get("passed", True))
+    reason = str(verdict.get("reason", ""))
+    suggestion = str(verdict.get("suggestion", ""))
+
+    if passed:
+        logger.info('feedback_check 质检通过')
+        # 通过即归零:迭代计数与失败原因不带入下一题/下一轮
+        return Command(goto="collect_branches", update={"feedback_notes": RESET, "model_iteration": 0})
+
+    logger.warning(f'feedback_check 质检不通过，打回 modeling 重做(第 {iteration + 1} 次): {reason}')
+    return Command(
+        goto="modeling",
+        update={
+            "answers": RESET,
+            "code_files": RESET,
+            "failed_qs": RESET,
+            "done_pairs": RESET,
+            "review_feedback": "",       # 清掉旧审核意见,避免 modeling 误判为审核打回
+            "retry_count": 0,
+            "tool_rounds": 0,
+            "model_iteration": iteration + 1,
+            "feedback_notes": [f"第{iteration + 1}次质检不通过：{reason} 修正建议：{suggestion}"],
+        },
+    )
+
 
 #用来初始化input_problem
 def load_problem(state: over_all_state) -> dict:
     """读取 question 文件夹里的题目文件（.txt/.md 按文本读，.pdf 用 pypdf 提取），合并后写入 input_problem 字段"""
     logger.info('正在运行load_problem节点')
-    path = Path(question_path)
+    path = question_dir()
+    if not path.is_dir():
+        return {"input_problem": "(question 文件夹为空)"}
     contents = []
     for item in path.iterdir():
         if not item.is_file():
@@ -114,28 +276,67 @@ def load_problem(state: over_all_state) -> dict:
         contents.append(f"=== {item.name} ===\n{text}")
     return {"input_problem": "\n\n".join(contents) if contents else "(question 文件夹为空)"}
 
-#对文本进行格式化用来初始化problem_str和problem_index
+#从 LLM 文本输出中提取 JSON 对象(容忍 ```json 围栏与前后杂文),失败抛 ValueError
+def _extract_json_obj(text: str) -> dict:
+    s = (text or "").strip()
+    s = re.sub(r"^```(?:json)?\s*", "", s)
+    s = re.sub(r"\s*```$", "", s)
+    l, r = s.find("{"), s.rfind("}")
+    if l == -1 or r <= l:
+        raise ValueError("输出中未找到 JSON 对象")
+    obj = json.loads(s[l:r + 1])
+    if not isinstance(obj, dict):
+        raise ValueError("JSON 不是对象")
+    return obj
+
+#对文本进行格式化用来初始化problem_str和problem_index。
+#固定走 struct_model(DeepSeek 非思考)——不随前端切换模型变化,规避强制思考模型
+#拒绝 with_structured_output 强制 tool_choice 的 400;三层降级保证流程不中断
 def question_structed(state:over_all_state) ->structed_output_state:
     logger.info('正在运行question_structed节点')
     input_problem=state['input_problem']
-    prompt = f"""
-    数学建模题目，提取出题目中所有编号问题的完整题干
-    （从“问题 X：”开始到下一个“问题”、“问题 X”或“相关说明”之前），
-    问题数量不固定，以题目实际编号为准，如“问题1”、“问题2”……
-    返回格式必须包含：
-    - problem_str: 完整题目全文
-    - problem_index: 字典，键为各问题编号（如“问题1”、“问题2”），值为对应问题的完整题干文本。
-    
-    题目内容：
-    {input_problem}
-    """
-    resp=model_with_struct.invoke(
-        [HumanMessage(prompt)]
+    prompt = (
+        "数学建模题目，提取出题目中所有编号问题的完整题干"
+        "（从“问题 X：”开始到下一个“问题”、“问题 X”或“相关说明”之前），"
+        "问题数量不固定，以题目实际编号为准，如“问题1”、“问题2”……\n"
+        "只输出一个 JSON 对象（不要代码围栏与解释文字），格式：\n"
+        '{"problem_str": "完整题目全文", "problem_index": {"问题1": "该问完整题干", "问题2": "..."}}\n\n'
+        f"题目内容：\n{input_problem}"
     )
-    return {
-        **resp,
-        'messages': [AIMessage(content="已成功提取问题索引")]
-    }
+
+    def _finalize(p_str: str, p_index, note: str) -> dict:
+        # 索引必须非空兜底:空字典会让下游视为"无小问",静默跳过四方法求解
+        index = p_index or {}
+        if not index and p_str:
+            index = {"问题1": p_str}
+            note += "；problem_index 为空，已把整题作为「问题1」兜底"
+        return {"problem_str": p_str or input_problem,
+                "problem_index": index,
+                "messages": [AIMessage(content=note)]}
+
+    # 第一层:结构化输出(固定 DeepSeek 非思考实例)
+    try:
+        _log_llm(model_with_struct, "问题提取·结构化")
+        resp = model_with_struct.invoke([HumanMessage(prompt)])
+        if isinstance(resp, dict) and resp.get("problem_str"):
+            return _finalize(str(resp["problem_str"]), resp.get("problem_index"), "已成功提取问题索引")
+        logger.warning(f"question_structed 结构化返回异常(resp={resp!r})，转手动解析")
+    except Exception as e:
+        logger.warning(f"question_structed 结构化调用失败({e})，回退普通文本调用")
+
+    # 第二层:同一 DeepSeek 实例的普通文本调用 + 手动 JSON 解析
+    try:
+        _log_llm(struct_model, "问题提取·文本回退")
+        raw = struct_model.invoke([HumanMessage(prompt)]).content
+        data = _extract_json_obj(raw)
+        if data.get("problem_str"):
+            return _finalize(str(data["problem_str"]), data.get("problem_index"), "已通过文本模式提取问题索引")
+        logger.warning(f"question_structed 手动解析缺少 problem_str(data={data!r})")
+    except Exception as e:
+        logger.warning(f"question_structed 文本回退解析失败({e})，走整题单问兜底")
+
+    # 第三层:整题单问兜底,保证求解全流程不被跳过
+    return _finalize(input_problem, {}, "问题索引提取失败，已把整题作为单问回退")
 
 #建模路由:工具调用未超限才进工具节点;超限后即使模型仍带 tool_calls 也强制进入审核,防止死循环
 def modeling_route(state: over_all_state) -> str:
@@ -169,11 +370,11 @@ def modeling(state: over_all_state) -> over_all_state:
         model_to_use = model_with_tool.bind_tools(tools, tool_choice="none")
         retry_hint = "\n（注意：工具调用次数已达上限，请不要再调用工具，直接根据已有信息给出最终分析。）"
     else:
-        model_to_use = model_with_tool
+        model_to_use = model_think_tool
         retry_hint = f"\n（当前工具已调用 {tool_rounds} 轮，失败 {retry_count} 次；如无需更多信息请直接给出最终分析。）"
 
-    # 首次进入节点时中断询问建模手思路；工具调用回退或审核打回时不再中断，直接继续分析
-    if is_tool_return or is_rework:
+    # 首次进入节点时中断询问建模手思路；工具调用回退、审核打回或质检打回时不再中断，直接继续分析
+    if is_tool_return or is_rework or bool(state.get("feedback_notes")):
         modeling_approach = ""
     else:
         modeling_approach = interrupt('请简述你的建模思路（可直接回车跳过）') or ""
@@ -207,10 +408,17 @@ def modeling(state: over_all_state) -> over_all_state:
         user_parts.append(f"建模手审核意见（请据此重新分析）：{state.get('review_feedback')}")
     else:
         user_parts.append("（用户未提供思路，请自行构思）")
+    # 质检打回:附上前轮失败原因,要求建模手针对性修正方案
+    feedback_notes = state.get("feedback_notes") or []
+    if feedback_notes:
+        user_parts.append(
+            "【重要】此前建模方案未通过质检被打回，历史失败原因如下（请务必针对性修正，不要重复同样的思路）：\n"
+            + "\n".join(f"- {note}" for note in feedback_notes)
+        )
     user_parts.append(retry_hint)
     user_message = "\n".join(user_parts)
 
-    response = model_to_use.invoke([
+    response = _invoke_llm(model_to_use, [
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_message)
     ])
@@ -262,7 +470,9 @@ def _read_file_by_suffix(path: Path) -> str:
 def read_dataset(state:over_all_state) -> over_all_state:
     """读取 dataset 文件夹里的数据文件（按后缀分发处理多种格式），合并后写入 dataset 字段"""
     logger.info('正在运行read_dataset节点')
-    path = Path(dataset_path)
+    path = dataset_dir()
+    if not path.is_dir():
+        return {"dataset": "(dataset 文件夹为空)"}
     contents = []
     for item in sorted(path.iterdir()):
         if not item.is_file():
@@ -301,23 +511,40 @@ MAX_TOOL_ROUNDS = 6
 
 #执行代码用的 Python 解释器:默认跟随当前运行环境(与 agent 同一解释器),可用环境变量 MATH_PYTHON_EXE 覆盖
 PYTHON_EXE = os.environ.get("MATH_PYTHON_EXE") or sys.executable
-CODE_DIR = WORKSPACE_ROOT / "code"
-PHOTO_DIR = WORKSPACE_ROOT / "photo"
+# 代码/图片目录随当前题目工作区动态解析（多题隔离）
+def code_dir() -> Path:
+    return ws_root() / "code"
+
+def photo_dir() -> Path:
+    return ws_root() / "photo"
 
 # 出图脚本执行:子进程重试次数 + LLM 自动修复轮数上限(均防死循环)
 RUN_RETRY = 2
 LLM_MAX_FIX = 2
 RUN_TIMEOUT = 30
+# 纯计算脚本(无 savefig/matplotlib):跑 1 次 + 失败重试 1 次;
+# stdout 只保留尾部 STDOUT_TAIL 字符——数值结果集中在最后几行 print,
+# 截断防止撑爆汇总节点上下文与 SSE 载荷
+CALC_RETRY = 1
+STDOUT_TAIL = 1200
 
 #从"问题N"键中提取编号用于排序
 def _num_key(k: str) -> int:
     m = re.search(r"\d+", k)
     return int(m.group()) if m else 0
 
-#此节点仅作为扇出前的入口(no-op),真正分发由条件边 dispatch_sends 完成
+#此节点在扇出前对问题索引做兜底归一化(能真正写回共享状态):
+#索引意外为空时把整题当作"问题1",保证 modeling 之后的所有读者
+#(屏障统计/求解任务/论文章节)都拿到一致且非空的小问清单
 def send_problem_index(state: over_all_state) -> dict:
     logger.info('正在运行 send_problem_index 节点')
-    return {}
+    if state.get("problem_index"):
+        return {}
+    fallback = (state.get("problem_str") or "").strip()
+    if not fallback:
+        return {}
+    logger.warning('problem_index 为空，已把整题作为「问题1」兜底')
+    return {"problem_index": {"问题1": fallback}}
 
 #屏障节点:四个方法×全部小问都交卷后才放行到 run_solutions,避免汇总读到部分结果
 def collect_branches(state: over_all_state) -> dict:
@@ -333,9 +560,10 @@ def collect_branches(state: over_all_state) -> dict:
 def dispatch_sends(state: over_all_state) -> list:
     problem_index = state.get("problem_index") or {}
     if not problem_index:
+        # send_problem_index 兜底后仍为空 = 连题目原文都没有,确实无内容可解
         return [Send("compare_summarize", {})]
-    dataset_dir = Path(dataset_path)
-    dataset_files = "\n".join(sorted(f.name for f in dataset_dir.iterdir() if f.is_file())) if dataset_dir.is_dir() else "(dataset 目录为空)"
+    ddir = dataset_dir()
+    dataset_files = "\n".join(sorted(f.name for f in ddir.iterdir() if f.is_file())) if ddir.is_dir() else "(dataset 目录为空)"
     return [
         Send("solve_with_method", {
             "method": m,
@@ -376,32 +604,32 @@ def solve_with_method(state: over_all_state) -> dict:
             "   - 画图前必须设置 matplotlib 中文字体: plt.rcParams['font.sans-serif']=['SimHei']; plt.rcParams['axes.unicode_minus']=False。"
         )
         msgs = [HumanMessage(prompt)]
-        #节点内工具循环:模型要调工具就在本地执行并继续,最多 MAX_TOOL_ROUNDS 轮
-        for _ in range(MAX_TOOL_ROUNDS + 1):
-            resp = model_with_tool.invoke(msgs)
-            if not getattr(resp, "tool_calls", None):
-                break
-            tool_msgs = []
-            for call in resp.tool_calls:
-                tool = TOOLS_BY_NAME.get(call["name"])
-                try:
-                    result = tool.invoke(call["args"]) if tool else f"未知工具: {call['name']}"
-                except Exception as e:
-                    result = f"工具执行失败: {e}"
-                tool_msgs.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
-            msgs = msgs + [resp] + tool_msgs
-        else:
-            #工具轮数超限:改用无工具绑定的模型强制输出最终答案
-            resp = model.invoke([*msgs, HumanMessage(
-                "工具调用次数已达上限。请不要再调用任何工具，直接给出当前小问的完整求解：思路与公式 + ```python 代码块。"
-            )])
-            if getattr(resp, "tool_calls", None):
-                results_parts.append(f"{q_key}: 求解失败(工具调用超限)")
-                failed.append(q_key)
-                continue
-
-        #解析最终答案并落盘
+        # 单问全流程隔离：LLM 调用/解析/落盘任一环节失败只损失该问，
+        # 记入 failed_qs 交给 feedback_check 处理，绝不拖崩整个分支
         try:
+            # 节点内工具循环：模型要调工具就在本地执行并继续，最多 MAX_TOOL_ROUNDS 轮
+            for _ in range(MAX_TOOL_ROUNDS + 1):
+                resp = _invoke_llm(model_with_tool, msgs, action=f"求解 {method}/{q_key}")
+                if not getattr(resp, "tool_calls", None):
+                    break
+                tool_msgs = []
+                for call in resp.tool_calls:
+                    tool = TOOLS_BY_NAME.get(call["name"])
+                    try:
+                        result = tool.invoke(call["args"]) if tool else f"未知工具: {call['name']}"
+                    except Exception as e:
+                        result = f"工具执行失败: {e}"
+                    tool_msgs.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+                msgs = msgs + [resp] + tool_msgs
+            else:
+                # 工具轮数超限：改用无工具绑定的模型强制输出最终答案
+                resp = _invoke_llm(model, [*msgs, HumanMessage(
+                    "工具调用次数已达上限。请不要再调用任何工具，直接给出当前小问的完整求解：思路与公式 + ```python 代码块。"
+                )], action=f"求解 {method}/{q_key}·工具超限兜底")
+                if getattr(resp, "tool_calls", None):
+                    raise RuntimeError("工具超限兜底实例仍要求调用工具")
+
+            # 解析最终答案并落盘
             content = resp.content
             m = re.search(r"```(?:[Pp]ython|[Pp]y3?)?\s*\n?(.*?)```", content, re.S)
             if not m:
@@ -426,11 +654,11 @@ def solve_with_method(state: over_all_state) -> dict:
 #把 code/ 下所有 png 移入 photo/(同名冲突自动加 _1/_2 后缀),保证 code/ 不残留图片
 def _sweep_pngs_to_photo() -> list:
     moved = []
-    for img in list(CODE_DIR.rglob("*.png")):
-        dest = PHOTO_DIR / img.name
+    for img in list(code_dir().rglob("*.png")):
+        dest = photo_dir() / img.name
         i = 1
         while dest.exists():
-            dest = PHOTO_DIR / f"{img.stem}_{i}{img.suffix}"
+            dest = photo_dir() / f"{img.stem}_{i}{img.suffix}"
             i += 1
         shutil.move(str(img), str(dest))
         moved.append(dest.name)
@@ -444,11 +672,11 @@ def _extract_savefig_paths(text: str) -> List[str]:
 
 # 执行单个出图脚本一次,返回结构化结果(不移动图片)
 def _run_one_script(script: Path, timeout: int) -> dict:
-    before = set(CODE_DIR.rglob("*.png"))
+    before = set(code_dir().rglob("*.png"))
     try:
         proc = subprocess.run(
             [PYTHON_EXE, script.name],
-            cwd=str(CODE_DIR),
+            cwd=str(code_dir()),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -461,7 +689,7 @@ def _run_one_script(script: Path, timeout: int) -> dict:
             "stdout": proc.stdout or "",
             "stderr": proc.stderr or "",
             "timed_out": False,
-            "new_imgs": list(set(CODE_DIR.rglob("*.png")) - before),
+            "new_imgs": list(set(code_dir().rglob("*.png")) - before),
             "exc": None,
         }
     except subprocess.TimeoutExpired:
@@ -474,10 +702,10 @@ def _run_one_script(script: Path, timeout: int) -> dict:
 def _move_imgs_to_photo(imgs) -> List[str]:
     moved = []
     for img in imgs:
-        dest = PHOTO_DIR / img.name
+        dest = photo_dir() / img.name
         i = 1
         while dest.exists():
-            dest = PHOTO_DIR / f"{img.stem}_{i}{img.suffix}"
+            dest = photo_dir() / f"{img.stem}_{i}{img.suffix}"
             i += 1
         shutil.move(str(img), str(dest))
         moved.append(dest.name)
@@ -519,7 +747,7 @@ def _llm_fix_script(script: Path, error_log: List[str], expected: List[str]) -> 
         "只输出代码块，不要多余解释。"
     )
     try:
-        resp = model.invoke([HumanMessage(prompt)])
+        resp = _invoke_llm(model_text, [HumanMessage(prompt)])
     except Exception as e:
         logger.error(f"LLM 修复调用失败: {e}")
         return False
@@ -544,16 +772,18 @@ def run_solutions(state: over_all_state) -> dict:
     logger.info('正在运行 run_solutions 节点')
     code_files = state.get("code_files") or []
     reports = []
-    PHOTO_DIR.mkdir(parents=True, exist_ok=True)
+    code_dir().mkdir(parents=True, exist_ok=True)
+    photo_dir().mkdir(parents=True, exist_ok=True)
 
     # 先清理上次运行/中断遗留的 png,避免"非本次新增"的图片永远移不进 photo/
     leftover = _sweep_pngs_to_photo()
     if leftover:
         reports.append({"file": "(清理遗留)", "status": f"移入上次遗留图片: {leftover}"})
 
-    to_run = []
+    to_run = []    # 出图脚本:重试 + LLM 修复 + 图片收集
+    to_calc = []   # 纯计算脚本:全量执行,捕获 stdout 数值结果
     for rel in code_files:
-        script = CODE_DIR / rel
+        script = code_dir() / rel
         if not script.is_file():
             reports.append({"file": rel, "status": "文件不存在,跳过"})
             continue
@@ -561,14 +791,34 @@ def run_solutions(state: over_all_state) -> dict:
         if "savefig" in text or "matplotlib" in text:
             to_run.append((rel, script))
         else:
-            reports.append({"file": rel, "status": "未运行(非出图脚本)"})
+            to_calc.append((rel, script))
+
+    # 纯计算脚本:真正执行并记录数值输出——汇总与论文的"关键数值"由此获得真实来源。
+    # 失败只记录不进人工介入循环(那是出图脚本专属),不阻塞主流程
+    for rel, script in to_calc:
+        r = None
+        for attempt in range(1 + CALC_RETRY):
+            timeout = RUN_TIMEOUT if attempt == 0 else RUN_TIMEOUT * 2
+            r = _run_one_script(script, timeout)
+            if not _run_error_msg(r, timeout):
+                break
+        if r is None:
+            continue
+        timeout = RUN_TIMEOUT
+        msg = _run_error_msg(r, timeout)
+        if msg:
+            reports.append({"file": rel, "status": f"失败: {msg}",
+                            "error": (r["stderr"] or "")[-400:]})
+        else:
+            reports.append({"file": rel, "status": "成功",
+                            "output": (r["stdout"] or "")[-STDOUT_TAIL:] or "(无输出)"})
 
     failed = []  # (rel, script, error_log)
 
     for rel, script in to_run:
         expected = _extract_savefig_paths(script.read_text(encoding="utf-8", errors="ignore"))
         # 重入跳过:期望图片已存在说明上一轮已成功
-        if expected and all((PHOTO_DIR / n).exists() for n in expected):
+        if expected and all((photo_dir() / n).exists() for n in expected):
             reports.append({"file": rel, "status": f"成功(已有图片,跳过): {expected}"})
             continue
 
@@ -585,7 +835,8 @@ def run_solutions(state: over_all_state) -> dict:
                 moved = _move_imgs_to_photo(r["new_imgs"])
                 if moved:
                     success = True
-                    reports.append({"file": rel, "status": f"成功,生成图片: {moved}（第{attempt + 1}次执行）"})
+                    reports.append({"file": rel, "status": f"成功,生成图片: {moved}（第{attempt + 1}次执行）",
+                                    "output": (r["stdout"] or "")[-STDOUT_TAIL:]})
                     break
                 msg = "运行成功但未生成任何图片(savefig 未生效?)"
             error_log.append(
@@ -610,7 +861,8 @@ def run_solutions(state: over_all_state) -> dict:
                     moved = _move_imgs_to_photo(r["new_imgs"])
                     if moved:
                         success = True
-                        reports.append({"file": rel, "status": f"成功,生成图片: {moved}（LLM 修复第{fix_i}轮后）"})
+                        reports.append({"file": rel, "status": f"成功,生成图片: {moved}（LLM 修复第{fix_i}轮后）",
+                                        "output": (r["stdout"] or "")[-STDOUT_TAIL:]})
                         break
                     msg = "运行成功但未生成图片"
                 error_log.append(
@@ -637,16 +889,18 @@ def run_solutions(state: over_all_state) -> dict:
         feedback = interrupt(
             f"以下出图脚本经 {RUN_RETRY} 次重试 + {LLM_MAX_FIX} 轮 LLM 修复仍失败:\n\n"
             f"{detail}\n\n"
-            "请处理:可直接修改 code/ 下对应脚本后回车重试(会带着你的修改重跑,仍失败会再次询问);"
-            "或输入 skip 跳过这些失败项继续。"
+            "【回车 = 跳过失败脚本,继续后续流程】\n"
+            "【输入 重试/继续 = 重跑(可先修改 code/ 下对应脚本,会带着修改重跑,仍失败会再次询问)】"
         )
-        fb = (feedback or "").strip()
-        if "skip" in fb.lower():
+        fb = (feedback or "").strip().lower()
+        # 语义:空输入或"跳过/通过"类词 = 跳过失败项继续;只有明确要求重试才重跑
+        skip = not fb or any(k in fb for k in ("skip", "pass", "通过", "跳过", "略过"))
+        if skip:
             for rel, _, _ in failed:
                 reports.append({"file": rel, "status": "已由人工选择跳过"})
             break
-        # 非 skip = 人工要求重试:本轮 resume 的重跑已在上方执行过;若仍失败则回到循环顶部再次询问
-        logger.info(f"人工未跳过(反馈: {fb[:50] or '(回车)'}),仍有 {len(failed)} 个失败脚本,继续人工介入")
+        # 明确要求重试:本轮 resume 的重跑已在上方执行过;若仍失败则回到循环顶部再次询问
+        logger.info(f"人工选择重试(反馈: {fb[:50]}),仍有 {len(failed)} 个失败脚本")
 
     return {"run_report": reports}
 
@@ -675,7 +929,7 @@ def compare_summarize(state: over_all_state) -> dict:
     msgs = state.get("compare_msgs") or []
     #工具刚返回:延续对话,让模型看到工具结果后继续
     if msgs and isinstance(msgs[-1], ToolMessage):
-        resp = model_with_tool.invoke(msgs)
+        resp = _invoke_llm(model_think_tool, msgs)
         to_append = []
     else:
         if not merged:
@@ -692,6 +946,9 @@ def compare_summarize(state: over_all_state) -> dict:
             f"代码运行情况:\n{run_text or '(无运行报告)'}\n\n"
             f"{feedback_line}"
             "如需查看生成的代码或图片,可调用 read_workspace 工具(work_dir 参数必填,只能是 code/paper/photo/dataset 之一)。\n"
+            "【数值真实性铁律】代码运行情况中各脚本的 stdout 输出是唯一可信的数值来源;"
+            "最终结论里的每一个关键数值都必须能在运行输出或各方法答卷的求解结果中找到出处,"
+            "严禁自行编造、估计或'合理化'数值;若某问缺少可信数值,如实写'该问数值待运行确认',不要虚构。\n"
             "请输出一份对比总结 Markdown 文档:\n"
             "1. 逐问对比四种方法的结论,标出结论一致与分歧之处;\n"
             "2. 结合代码运行情况(成功/失败/生成的图),说明结果可信度;\n"
@@ -701,7 +958,7 @@ def compare_summarize(state: over_all_state) -> dict:
             "(供论文撰写章节直接引用,数值必须与前述结论一致)。\n\n"
             f"【中文写作规范(去 AI 味,务必严格遵循)】\n{read_writing_skill('de-AI')}"
         )
-        resp = model_with_tool.invoke([HumanMessage(prompt)])
+        resp = _invoke_llm(model_think_tool, [HumanMessage(prompt)])
         to_append = [HumanMessage(prompt)]
 
     #模型想调工具:交给工具节点,工具结果会自动回到本节点继续
@@ -723,7 +980,7 @@ def final_analysis(state:over_all_state) ->Command:
     )
     feedback=(feedback or '').strip()
     if not feedback or any(k in feedback for k in ('通过','认可')):
-        return Command(goto="write_article")
+        return Command(goto="fill_document_meta")
     return Command(goto='compare_summarize', update={
         'human_feedback': feedback,
         'compare_msgs': [RemoveMessage(id=m.id) for m in (state.get("compare_msgs") or []) if getattr(m, "id", None)],
@@ -731,8 +988,10 @@ def final_analysis(state:over_all_state) ->Command:
     
 
 # ============ 论文撰写节点：把最终结论/思路/图片填入 LaTeX 国赛模板的独立副本 ============
-# 输出目录：paper/latex/（独立副本，不污染原始 writter_struct 模板）
-LATEX_OUT = WORKSPACE_ROOT / "paper" / "latex"
+# 输出目录：paper/latex/（随当前题目工作区，独立副本，不污染原始 writter_struct 模板）
+def latex_out() -> Path:
+    return ws_root() / "paper" / "latex"
+
 WRITER_TEMPLATE = WORKSPACE_ROOT / "writter_struct"
 # 模板里只复制一次、之后不再覆盖的静态文件（类文件/编译脚本/参考文献库等）
 LATEX_STATIC = ["cumcmthesis.cls", "book.bib", "build.bat", "clean.bat",
@@ -791,21 +1050,21 @@ ARTICLE_CHAPTERS = [
 
 def _ensure_latex_skeleton():
     """首次把 writter_struct 模板静态文件复制到 paper/latex 独立副本；已存在则不覆盖。"""
-    LATEX_OUT.mkdir(parents=True, exist_ok=True)
+    latex_out().mkdir(parents=True, exist_ok=True)
     for name in LATEX_STATIC:
         src = WRITER_TEMPLATE / name
-        dst = LATEX_OUT / name
+        dst = latex_out() / name
         if src.exists() and not dst.exists():
             shutil.copy(src, dst)
-    (LATEX_OUT / "texfile").mkdir(parents=True, exist_ok=True)
-    (LATEX_OUT / "texfile" / "figures").mkdir(parents=True, exist_ok=True)
-    (LATEX_OUT / "code").mkdir(parents=True, exist_ok=True)
+    (latex_out() / "texfile").mkdir(parents=True, exist_ok=True)
+    (latex_out() / "texfile" / "figures").mkdir(parents=True, exist_ok=True)
+    (latex_out() / "code").mkdir(parents=True, exist_ok=True)
     # 复制模板自带的 code 示例，避免附录 \lstinputlisting 缺文件
     tcode = WRITER_TEMPLATE / "code"
     if tcode.is_dir():
         for f in tcode.iterdir():
-            if f.is_file() and not (LATEX_OUT / "code" / f.name).exists():
-                shutil.copy(f, LATEX_OUT / "code" / f.name)
+            if f.is_file() and not (latex_out() / "code" / f.name).exists():
+                shutil.copy(f, latex_out() / "code" / f.name)
 
 
 def _strip_tex_fences(text: str) -> str:
@@ -819,9 +1078,9 @@ def _strip_tex_fences(text: str) -> str:
 
 def _clean_latex_output():
     """清空上一轮生成的章节/图片/代码，避免换题或重跑时残留旧产物。"""
-    for f in (LATEX_OUT / "texfile").glob("*.tex"):
+    for f in (latex_out() / "texfile").glob("*.tex"):
         f.unlink()
-    for d in ((LATEX_OUT / "texfile" / "figures"), (LATEX_OUT / "code")):
+    for d in ((latex_out() / "texfile" / "figures"), (latex_out() / "code")):
         for f in d.glob("*"):
             if f.is_file():
                 f.unlink()
@@ -843,8 +1102,8 @@ def _find_xelatex():
 
 
 def _run_xelatex(xe: str) -> str:
-    """在 LATEX_OUT 跑一遍 xelatex，返回 document.log 文本；先清理残留的 synctex 锁文件。"""
-    for busy in LATEX_OUT.glob("*.synctex(busy)"):
+    """在 latex_out() 跑一遍 xelatex，返回 document.log 文本；先清理残留的 synctex 锁文件。"""
+    for busy in latex_out().glob("*.synctex(busy)"):
         try:
             busy.unlink()
         except OSError:
@@ -852,12 +1111,12 @@ def _run_xelatex(xe: str) -> str:
     try:
         subprocess.run(
             [xe, "-interaction=nonstopmode", "document.tex"],
-            cwd=str(LATEX_OUT), capture_output=True, text=True,
+            cwd=str(latex_out()), capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=LATEX_TIMEOUT,
         )
     except Exception as e:
         return f"! xelatex 运行失败: {e}"
-    log_path = LATEX_OUT / "document.log"
+    log_path = latex_out() / "document.log"
     return log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
 
 
@@ -891,7 +1150,7 @@ def _fix_latex_with_llm(errors: List[Dict[str, str]]) -> List[str]:
     for e in errors:
         parts.append(f"[错误·{e['file']}] {e['msg']}")
     for f in files:
-        path = LATEX_OUT / f
+        path = latex_out() / f
         if path.exists():
             parts.append(f"===== 文件 {f} 完整内容 =====\n" + path.read_text(encoding="utf-8", errors="replace"))
     parts.append(
@@ -901,7 +1160,7 @@ def _fix_latex_with_llm(errors: List[Dict[str, str]]) -> List[str]:
         "===FILE: texfile/文件名.tex===\n修复后的完整文件内容\n===END==="
     )
     try:
-        resp = model.invoke([HumanMessage("\n\n".join(parts))])
+        resp = _invoke_llm(model_text, [HumanMessage("\n\n".join(parts))])
     except Exception as e:
         logger.error(f"LLM 修复编译错误调用失败: {e}")
         return []
@@ -910,7 +1169,7 @@ def _fix_latex_with_llm(errors: List[Dict[str, str]]) -> List[str]:
         fname, content = m.group(1).strip(), m.group(2).strip()
         if fname.startswith("texfile/") and content:
             content = _strip_tex_fences(content)
-            (LATEX_OUT / fname).write_text(content + "\n", encoding="utf-8")
+            (latex_out() / fname).write_text(content + "\n", encoding="utf-8")
             fixed.append(fname)
     return fixed
 
@@ -928,14 +1187,14 @@ def write_article(state: over_all_state) -> dict:
 
     # 1. 同步图片：photo/*.png -> paper/latex/texfile/figures/
     figs = []
-    for img in PHOTO_DIR.glob("*.png"):
-        shutil.copy(img, LATEX_OUT / "texfile" / "figures" / img.name)
+    for img in photo_dir().glob("*.png"):
+        shutil.copy(img, latex_out() / "texfile" / "figures" / img.name)
         figs.append(img.name)
     # 2. 同步求解代码：code/*.py -> paper/latex/code/（供附录 \lstinputlisting 引用）
     for cf in code_files:
-        src = CODE_DIR / cf
+        src = code_dir() / cf
         if src.exists():
-            shutil.copy(src, LATEX_OUT / "code" / cf)
+            shutil.copy(src, latex_out() / "code" / cf)
 
     skill = read_writing_skill("de-AI")
     done = []
@@ -977,9 +1236,9 @@ def write_article(state: over_all_state) -> dict:
             "只输出该章节的完整 LaTeX 正文（不要 \\documentclass、不要 \\begin{document}、不要解释性文字、不要代码围栏），"
             "直接可被 \\input 引用。"
         )
-        target = LATEX_OUT / "texfile" / f"{fname}.tex"
+        target = latex_out() / "texfile" / f"{fname}.tex"
         try:
-            raw = model.invoke([HumanMessage(prompt)]).content
+            raw = _invoke_llm(model_text, [HumanMessage(prompt)]).content
             latex = _strip_tex_fences(raw)
             if not latex:
                 raise ValueError("模型返回为空")
@@ -1024,7 +1283,7 @@ def write_article(state: over_all_state) -> dict:
 # 回填 document.tex 封面元信息：标题由 LLM 自动生成，题号/报名号/学校/年份由人工 interrupt 提供
 def fill_document_meta(state: over_all_state) -> dict:
     logger.info("正在运行 fill_document_meta 节点：回填 document.tex 元信息")
-    doc_path = LATEX_OUT / "document.tex"
+    doc_path = latex_out() / "document.tex"
     if not doc_path.exists():
         return {"messages": [AIMessage(content="document.tex 不存在，跳过元信息回填")]}
 
@@ -1052,7 +1311,7 @@ def fill_document_meta(state: over_all_state) -> dict:
             "要求准确、学术、体现核心方法或对象，不要带书名号。只输出标题本身。\n"
             f"题目：{state.get('problem_str') or ''}"
         )
-        new_title = model.invoke([HumanMessage(title_prompt)]).content.strip().strip("《》").strip()
+        new_title = _invoke_llm(model, [HumanMessage(title_prompt)], action="封面标题生成").content.strip().strip("《》").strip()
     except Exception as e:
         logger.warning(f"生成标题失败: {e}")
         new_title = ""
@@ -1092,13 +1351,6 @@ def fill_document_meta(state: over_all_state) -> dict:
 #测试时建立检查点暂时用内存存储
 checkpointer=InMemorySaver()
 
-#配置线程id
-config={
-    'configurable':{
-        'thread_id':'1111'
-    }
-}
-
 #Studio/API 模式发起 run 时输入可能为空,单独声明空输入状态避免 EmptyInputError
 class input_state(TypedDict):
     pass
@@ -1114,13 +1366,14 @@ builder.add_node('review_modeling_analysis',review_modeling_analysis)
 builder.add_node('send_problem_index',send_problem_index)
 builder.add_node('collect_branches',collect_branches)
 builder.add_node('solve_with_method',solve_with_method)
+builder.add_node('feedback_check',feedback_check)
 builder.add_node('run_solutions',run_solutions)
 builder.add_node('compare_summarize',compare_summarize)
 builder.add_node('compare_tool_node',ToolNode(tools=tools, messages_key="compare_msgs"))
 builder.add_node('final_analysis', final_analysis)
 builder.add_node('write_article', write_article)
 builder.add_node('fill_document_meta', fill_document_meta)
-builder.add_edge("write_article", "fill_document_meta")
+builder.add_edge("write_article", "final_analysis")
 builder.add_edge("fill_document_meta", END)
 
 builder.add_edge(START, 'load_problem')  
@@ -1139,11 +1392,11 @@ builder.add_conditional_edges(
     dispatch_sends,
     ["solve_with_method", "compare_summarize"]
 )
-builder.add_edge("solve_with_method", "collect_branches")
+builder.add_edge("solve_with_method", "feedback_check")
 builder.add_conditional_edges(
     "compare_summarize",
     compare_route,
-    {"tools": "compare_tool_node", "continue_next": "compare_summarize", "end": "final_analysis"}
+    {"tools": "compare_tool_node", "continue_next": "compare_summarize", "end": "write_article"}
 )
 builder.add_edge("compare_tool_node", "compare_summarize")
 builder.add_edge("collect_branches", "run_solutions")
@@ -1157,6 +1410,12 @@ else:
 
 
 if __name__ == "__main__":
+    # CLI 直跑：线程 id = 当前题目工作区（默认 default；可用环境变量 MATH_WS 指定）
+    ws = os.environ.get("MATH_WS") or get_workspace()
+    set_workspace(ws)
+    config = {"configurable": {"thread_id": ws}}
+    print(f"当前题目: {ws}（工作区: {ws_root()}）")
+
     #首次运行：执行到第一个 interrupt 处暂停
     graph.invoke({}, config=config)
 

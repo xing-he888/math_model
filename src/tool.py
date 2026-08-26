@@ -19,6 +19,21 @@ search = TavilySearchResults(max_results=2)
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 ALLOWED_DIRS = {"code", "paper", "photo", "dataset"}
 
+# ── 多题目隔离：工作区按题目分目录（workspaces/{题目id}/），set_workspace 切换当前题目 ──
+_CURRENT_WS = "default"
+
+def set_workspace(ws_id: str) -> None:
+    """切换当前题目工作区（线程串行执行，无并发问题）"""
+    global _CURRENT_WS
+    _CURRENT_WS = (ws_id or "default").strip() or "default"
+
+def get_workspace() -> str:
+    return _CURRENT_WS
+
+def ws_root() -> Path:
+    """当前题目的工作区根目录（question/dataset/paper/code/photo 都在其下）"""
+    return WORKSPACE_ROOT / "workspaces" / _CURRENT_WS
+
 #解析并校验工作区内的目标路径,非法路径直接抛 ValueError 交由 LangGraph 重试
 def _resolve_path(work_dir: str, rel_path: str) -> Path:
     if not work_dir or work_dir not in ALLOWED_DIRS:
@@ -28,8 +43,9 @@ def _resolve_path(work_dir: str, rel_path: str) -> Path:
     p = Path(rel_path)
     if p.is_absolute() or ".." in p.parts:
         raise ToolException(f"rel_path 必须是相对路径且不能包含 '..',收到: {rel_path}")
-    target = (WORKSPACE_ROOT / work_dir / p).resolve()
-    if not target.is_relative_to(WORKSPACE_ROOT.resolve()):
+    root = ws_root()
+    target = (root / work_dir / p).resolve()
+    if not target.is_relative_to(root.resolve()):
         raise ToolException(f"路径超出工作区范围: {rel_path}")
     return target
 

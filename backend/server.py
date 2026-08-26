@@ -27,16 +27,21 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 os.chdir(PROJECT_ROOT)
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi import HTTPException
 from langgraph.types import Command
 from loguru import logger
 from pydantic import BaseModel
+from datetime import datetime
+import shutil
+import re
+import time
 
 from src.agent import graph, checkpointer, set_model, list_models
 from src.models import MODEL_REGISTRY
+from src.tool import set_workspace, get_workspace, ws_root
 
 DEFAULT_THREAD_ID = os.environ.get("MATH_THREAD_ID", "1111")
 DEFAULT_PORT = int(os.environ.get("MATH_BACKEND_PORT", "8000"))
@@ -44,6 +49,116 @@ DEFAULT_PORT = int(os.environ.get("MATH_BACKEND_PORT", "8000"))
 # ---------- 模型选择持久化（配置一次一直可用，类似 opencode 的配置文件） ----------
 CONFIG_PATH = PROJECT_ROOT / "model_config.json"
 ENV_PATH = PROJECT_ROOT / ".env"
+
+# ---------- 前端外观设置持久化（液态玻璃主题 + 背景模式，dsh-wallpaper-engine 同思路） ----------
+UI_CONFIG_PATH = PROJECT_ROOT / "ui_config.json"
+
+UI_DEFAULTS = {
+    "accent": "#4f8cff",       # 强调色（配色预设 + 自定义）
+    "glassAlpha": 12,          # 玻璃透明度 0-60，越大越透
+    "glassColor": "#ffffff",   # 玻璃基底色
+    "blur": 16,                # 玻璃模糊半径 px（0 = 关闭毛玻璃）
+    "scrim": 0.25,             # 背景压暗 0-1
+    "border": 0.35,            # 边框强调 0-1
+    "wallpaperBlur": 0,        # 背景自身模糊 px
+    "objectFit": "cover",      # cover / contain / center / fill
+    "flip": False,             # 水平翻转
+    "bgMode": "image",         # image / video / carousel
+    "bgFile": "bg-miku.jpg",   # 当前背景素材（photo 或 media 目录下的文件名）
+    "carouselSecs": 30,        # 轮播间隔秒
+    "playbackRate": 1,         # 视频倍速 0.5-2
+    "glassWindow": True,       # 弹窗/面板玻璃总开关
+    # —— dsh 同款（第二批补齐）——
+    "pauseOnHidden": True,     # 页面隐藏（最小化/切标签）时暂停视频
+    "pauseOnBlur": False,      # 窗口失焦时暂停视频
+    "pauseOnBattery": False,   # 电池供电时暂停视频
+    "typeFilter": "all",       # 素材列表过滤：all / image / video
+    "hiddenIds": [],           # 隐藏（软删除）的素材文件名
+    "shuffle": False,          # 轮播随机顺序
+    "mediaDir": "media",       # 背景素材目录（相对项目根；改存储位置=改这个）
+    # —— WE 壁纸库（dsh 同款：读 Steam workshop）——
+    "bgSource": "local",       # local（media 目录）/ we（Wallpaper Engine 壁纸库）
+    "weId": "",                # 当前选中的 WE 壁纸 id
+    "contentRatingFilter": "all",  # WE 壁纸分级过滤：all / everyone / pg13 / mature / unrated
+}
+
+def _load_ui_config() -> dict:
+    cfg = {}
+    try:
+        if UI_CONFIG_PATH.exists():
+            cfg = json.loads(UI_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        cfg = {}
+    out = dict(UI_DEFAULTS)
+    for k, v in cfg.items():
+        if k not in UI_DEFAULTS:
+            continue
+        if k in ("accent", "glassColor") and isinstance(v, str) and len(v) == 7 and v.startswith("#"):
+            out[k] = v
+        elif k == "objectFit" and v in ("cover", "contain", "center", "fill"):
+            out[k] = v
+        elif k == "bgMode" and v in ("image", "video", "carousel"):
+            out[k] = v
+        elif k == "typeFilter" and v in ("all", "image", "video"):
+            out[k] = v
+        elif k == "bgSource" and v in ("local", "we"):
+            out[k] = v
+        elif k == "contentRatingFilter" and v in ("all", "everyone", "pg13", "mature", "unrated"):
+            out[k] = v
+        elif k == "weId" and isinstance(v, str) and v and "/" not in v and "\\" not in v:
+            out[k] = v
+        elif k == "bgFile" and isinstance(v, str) and v and "/" not in v and "\\" not in v:
+            out[k] = v
+        elif k == "mediaDir" and isinstance(v, str) and v and "/" not in v and "\\" not in v:
+            out[k] = v
+        elif k == "hiddenIds" and isinstance(v, list):
+            out[k] = [x for x in v if isinstance(x, str) and x and "/" not in x and "\\" not in x]
+        elif k in ("flip", "glassWindow", "pauseOnHidden", "pauseOnBlur", "pauseOnBattery", "shuffle"):
+            out[k] = bool(v)
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[k] = v
+    return out
+
+def _save_ui_config(patch: dict) -> dict:
+    """读-改-写合并保存外观配置；非法字段回退默认值。"""
+    cfg = _load_ui_config()
+    for k, v in patch.items():
+        if k not in UI_DEFAULTS:
+            continue
+        if k in ("accent", "glassColor"):
+            cfg[k] = v if isinstance(v, str) and len(v) == 7 and v.startswith("#") else UI_DEFAULTS[k]
+        elif k == "objectFit":
+            cfg[k] = v if v in ("cover", "contain", "center", "fill") else UI_DEFAULTS[k]
+        elif k == "bgMode":
+            cfg[k] = v if v in ("image", "video", "carousel") else UI_DEFAULTS[k]
+        elif k == "typeFilter":
+            cfg[k] = v if v in ("all", "image", "video") else UI_DEFAULTS[k]
+        elif k == "bgSource":
+            cfg[k] = v if v in ("local", "we") else UI_DEFAULTS[k]
+        elif k == "contentRatingFilter":
+            cfg[k] = v if v in ("all", "everyone", "pg13", "mature", "unrated") else UI_DEFAULTS[k]
+        elif k == "weId":
+            cfg[k] = v if isinstance(v, str) and v and "/" not in v and "\\" not in v else UI_DEFAULTS[k]
+        elif k in ("bgFile", "mediaDir"):
+            cfg[k] = v if isinstance(v, str) and v and "/" not in v and "\\" not in v else UI_DEFAULTS[k]
+        elif k == "hiddenIds":
+            cfg[k] = [x for x in v if isinstance(x, str) and x and "/" not in x and "\\" not in x] if isinstance(v, list) else []
+        elif k in ("flip", "glassWindow", "pauseOnHidden", "pauseOnBlur", "pauseOnBattery", "shuffle"):
+            cfg[k] = bool(v)
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            # 各滑杆的合理区间裁剪
+            lo, hi = {"glassAlpha": (0, 60), "blur": (0, 60), "scrim": (0, 1),
+                      "border": (0, 1), "wallpaperBlur": (0, 60),
+                      "carouselSecs": (3, 3600), "playbackRate": (0.5, 2)}.get(k, (None, None))
+            if lo is not None:
+                cfg[k] = max(lo, min(hi, v))
+            else:
+                cfg[k] = v
+    try:
+        UI_CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"保存外观配置失败: {e}")
+    return cfg
 
 def _load_config() -> dict:
     try:
@@ -104,11 +219,14 @@ class ModelName(BaseModel):
     api_key: Optional[str] = None
 
 class StreamBody(BaseModel):
-    """resume 缺省表示启动新运行; 提供时表示恢复被 interrupt 挂起的运行；model 指定本次运行的模型，api_key 为非 deepseek 模型必填"""
+    """resume 缺省表示启动新运行; 提供时表示恢复被 interrupt 挂起的运行；
+    continue_run=True 表示从最近 checkpoint 续跑(崩溃/中止后, 无挂起中断场景);
+    model 指定本次运行的模型，api_key 为非 deepseek 模型必填"""
     resume: Optional[str] = None
     thread_id: Optional[str] = None
     model: Optional[str] = None
     api_key: Optional[str] = None
+    continue_run: bool = False
 
 class KeysBody(BaseModel):
     """批量保存 API Key（持久化到 model_config.json），可选同时设定默认模型；不会切换本次运行。"""
@@ -164,10 +282,79 @@ def _extract_interrupts(payload) -> list:
     return [{"value": getattr(it, "value", str(it))} for it in its]
 
 
-async def _stream_events(resume: Optional[str], thread_id: str, model: Optional[str] = None, api_key: Optional[str] = None):
+async def _stream_events(resume: Optional[str], thread_id: str, model: Optional[str] = None, api_key: Optional[str] = None, continue_run: bool = False):
     runtime_config = {"configurable": {"thread_id": thread_id}}
+    loop = asyncio.get_running_loop()
+    out_q: asyncio.Queue = asyncio.Queue()  # ("chunk", sse) | ("done", None) | ("stop", None)
+
+    # 把 src.agent 的"LLM调用"日志实时桥接进 SSE:
+    # 这些日志在节点执行中途产生,若只随节点 update 推送会滞后到节点结束,故用 sink 直推
+    def _llm_log_sink(message) -> None:
+        text = str(message).strip()
+        if text.startswith("LLM调用"):
+            try:
+                loop.call_soon_threadsafe(
+                    out_q.put_nowait,
+                    ("chunk", _sse({"type": "log", "text": text})),
+                )
+            except RuntimeError:
+                pass  # 事件循环已关闭(客户端断开),静默丢弃
+
+    sink_id = logger.add(_llm_log_sink, format="{message}", level="INFO")
+
+    async def _pump(inputs) -> None:
+        """跑图并把节点更新/中断转成 SSE 块塞进队列;异常与中断都归为 stop。"""
+        is_resume = isinstance(inputs, Command)
+        mode = "resume(中断恢复)" if is_resume else ("continue(检查点续跑)" if inputs is None else "新运行")
+        logger.info(f"[stream] pump 启动: {mode}")
+        agen = graph.astream(
+            inputs,
+            config=runtime_config,
+            stream_mode="updates",
+        )
+        try:
+            async for update in agen:
+                if not isinstance(update, dict):
+                    continue
+                stop = False
+                for node, payload in update.items():
+                    if node == "__interrupt__" and isinstance(payload, (list, tuple)):
+                        its = [{"value": getattr(it, "value", str(it))} for it in payload]
+                    else:
+                        its = _extract_interrupts(payload)
+                    if its:
+                        logger.info(f"[stream] 中断 @ {node},挂起等待人工输入")
+                        for it in its:
+                            out_q.put_nowait(("chunk", _sse({"type": "interrupt", "node": node, "value": it["value"]})))
+                        out_q.put_nowait(("chunk", _sse({"type": "suspended"})))
+                        out_q.put_nowait(("stop", None))  # 终止信号:主循环 break → 释放 _run_lock → 响应正常结束
+                        stop = True
+                        break
+                    out_q.put_nowait(("chunk", _sse({"type": "update", "node": node, "data": _simplify(payload)})))
+                if stop:
+                    return
+            logger.info("[stream] astream 迭代自然结束(图跑到 END)")
+            out_q.put_nowait(("done", None))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("[stream] 运行异常")
+            out_q.put_nowait(("chunk", _sse({"type": "error", "error": str(e)})))
+            out_q.put_nowait(("stop", None))
+        finally:
+            # 显式关闭 astream 生成器:中断提前 return 时不留僵尸生成器,
+            # 避免其延迟 GC 触发的 GeneratorExit 清理干扰同线程的下一次 resume
+            try:
+                await agen.aclose()
+            except Exception:
+                pass
+
+    stopped = False
+    pump_task = None
     try:
         async with _run_lock:
+            # 题目隔离：thread_id 即题目 id，把 agent 的工作区切到该题的 workspaces/{id}/
+            set_workspace(thread_id)
             # 应用本次运行指定的模型（前端下拉框选择）
             if model:
                 # 若请求带了 key，先写入对应环境变量
@@ -179,7 +366,27 @@ async def _stream_events(resume: Optional[str], thread_id: str, model: Optional[
                     set_model(model)
                 except Exception as e:
                     logger.warning(f"切换模型失败，沿用当前模型: {e}")
-            if resume is not None:
+            if continue_run:
+                # 从最近 checkpoint 续跑:
+                #   无待续节点(线程为空/已跑完) → 按新运行处理;
+                #   有挂起 interrupt(等人工输入) → Command(resume="") 跳过当前提问继续;
+                #   中途崩溃/中止(有 next 无 interrupt) → inputs=None 原地继续(langgraph 断点续跑语义)
+                try:
+                    snap = graph.get_state(runtime_config)
+                    has_interrupt = any(getattr(t, "interrupts", None) for t in (snap.tasks or ()))
+                except Exception:
+                    snap, has_interrupt = None, False
+                if snap is None or not snap.next:
+                    try:
+                        checkpointer.delete_thread(thread_id)
+                    except Exception:
+                        pass
+                    inputs = {}
+                elif has_interrupt:
+                    inputs = Command(resume="")
+                else:
+                    inputs = None
+            elif resume is not None:
                 inputs = Command(resume=resume)
             else:
                 # 开始新运行时清空线程残留状态, 保证从头开始
@@ -188,30 +395,26 @@ async def _stream_events(resume: Optional[str], thread_id: str, model: Optional[
                 except Exception:
                     pass
                 inputs = {}
-            async for update in graph.astream(
-                inputs,
-                config=runtime_config,
-                stream_mode="updates",
-            ):
-                if not isinstance(update, dict):
-                    continue
-                for node, payload in update.items():
-                    if node == "__interrupt__" and isinstance(payload, (list, tuple)):
-                        its = [{"value": getattr(it, "value", str(it))} for it in payload]
-                    else:
-                        its = _extract_interrupts(payload)
-                    if its:
-                        for it in its:
-                            yield _sse({"type": "interrupt", "node": node, "value": it["value"]})
-                        yield _sse({"type": "suspended"})
-                        return
-                    yield _sse({"type": "update", "node": node, "data": _simplify(payload)})
-        yield _sse({"type": "done", "thread_id": thread_id})
+            pump_task = asyncio.create_task(_pump(inputs))
+            logger.info(f"[stream] 锁已获取,pump 已调度 (thread={thread_id})")
+            while True:
+                kind, payload = await out_q.get()
+                if kind != "chunk":
+                    stopped = kind == "stop"
+                    break
+                yield payload
+            logger.info(f"[stream] 主循环结束: {'stop(挂起/异常)' if stopped else 'done(完成)'}")
+        if not stopped:
+            yield _sse({"type": "done", "thread_id": thread_id})
     except asyncio.CancelledError:
         raise
     except Exception as e:
         logger.exception("运行异常")
         yield _sse({"type": "error", "error": str(e)})
+    finally:
+        if pump_task is not None and not pump_task.done():
+            pump_task.cancel()
+        logger.remove(sink_id)
 
 
 @app.get("/api/models")
@@ -295,7 +498,7 @@ async def stream_run(body: StreamBody):
             raise HTTPException(400, f"使用 {body.model} 需要 API Key，请在下拉框填入后保存/运行")
     logger.info(f"线程 {thread_id} 收到运行请求, resume={body.resume is not None}")
     return StreamingResponse(
-        _stream_events(body.resume, thread_id, body.model, body.api_key),
+        _stream_events(body.resume, thread_id, body.model, body.api_key, body.continue_run),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -305,24 +508,25 @@ async def stream_run(body: StreamBody):
 
 
 def _resolve_work_path(work_dir: str, rel_path: str = "") -> Path:
-    """校验并解析工作区路径, 非法路径抛 400"""
+    """校验并解析当前题目工作区路径, 非法路径抛 400"""
     if work_dir not in ALLOWED_WORK_DIRS:
         raise HTTPException(400, f"work_dir 只能是 {'/'.join(sorted(ALLOWED_WORK_DIRS))}, 收到: {work_dir!r}")
     p = Path(rel_path) if rel_path else Path(".")
     if p.is_absolute() or ".." in p.parts:
         raise HTTPException(400, f"rel_path 必须是相对路径且不能包含 '..': {rel_path}")
-    target = (PROJECT_ROOT / work_dir / p).resolve()
-    if not target.is_relative_to((PROJECT_ROOT / work_dir).resolve()):
+    base = ws_root()
+    target = (base / work_dir / p).resolve()
+    if not target.is_relative_to((base / work_dir).resolve()):
         raise HTTPException(400, f"路径超出 {work_dir} 目录: {rel_path}")
     return target
 
 
 @app.get("/api/files")
 async def list_files(work_dir: str):
-    """列出工作区目录下的文件与文件夹(名称+大小), 供前端实时刷新"""
+    """列出当前题目工作区目录下的文件与文件夹(名称+大小), 供前端实时刷新"""
     if work_dir not in ALLOWED_WORK_DIRS:
         raise HTTPException(400, f"work_dir 只能是 {'/'.join(sorted(ALLOWED_WORK_DIRS))}")
-    root = PROJECT_ROOT / work_dir
+    root = ws_root() / work_dir
     if not root.is_dir():
         return {"work_dir": work_dir, "files": []}
     items = []
@@ -357,14 +561,528 @@ async def get_image(work_dir: str, rel_path: str = ""):
     return FileResponse(str(target))
 
 
+@app.get("/api/ui-config")
+async def get_ui_config():
+    """读取前端外观配置（液态玻璃主题 + 背景模式），不存在时返回默认值"""
+    return _load_ui_config()
+
+
+@app.put("/api/ui-config")
+async def put_ui_config(body: dict):
+    """合并保存前端外观配置到 ui_config.json（字段白名单 + 区间裁剪）"""
+    cfg = _save_ui_config(body if isinstance(body, dict) else {})
+    return cfg
+
+
+def _media_dir() -> Path:
+    """背景素材目录（可配置，默认项目根/media；改存储位置 = 改 mediaDir）"""
+    rel = _load_ui_config().get("mediaDir") or "media"
+    d = PROJECT_ROOT / rel
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+MEDIA_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".mp4", ".webm")
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
+VIDEO_EXTS = (".mp4", ".webm")
+
+
+def _find_ffmpeg() -> str | None:
+    """定位 ffmpeg：环境变量 MATH_FFMPEG → PATH → dsh 插件目录。找不到返回 None（功能自动降级）。"""
+    env = os.environ.get("MATH_FFMPEG")
+    if env and Path(env).is_file():
+        return env
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
+    for cand in (PROJECT_ROOT / "ffmpeg" / "ffmpeg.exe",
+                 Path.home() / ".dsh-wallpaper-engine" / "ffmpeg" / "ffmpeg.exe"):
+        if cand.is_file():
+            return str(cand)
+    return None
+
+
+@app.get("/api/media")
+async def list_media():
+    """列出背景素材目录下的图片/视频，供前端背景选择器使用"""
+    root = _media_dir()
+    if not root.is_dir():
+        return {"files": []}
+    items = []
+    for f in sorted(root.iterdir()):
+        if f.is_file() and f.suffix.lower() in MEDIA_EXTS:
+            items.append({"name": f.name, "size": f.stat().st_size})
+    return {"files": items}
+
+
+@app.get("/api/media/file")
+async def get_media_file(name: str = ""):
+    """按文件名返回背景素材（FileResponse 原生支持 Range，可拖进度）"""
+    if not name or "/" in name or "\\" in name or ".." in name:
+        raise HTTPException(400, "非法文件名")
+    target = _media_dir() / name
+    if not target.is_file():
+        raise HTTPException(404, f"素材不存在: {target}")
+    return FileResponse(str(target))
+
+
+@app.post("/api/media/upload")
+async def upload_media(file: UploadFile):
+    """上传自定义背景素材（jpg/png/webp/mp4/webm），存到背景素材目录"""
+    name = file.filename or ""
+    if not name or "/" in name or "\\" in name:
+        raise HTTPException(400, "非法文件名")
+    ext = Path(name).suffix.lower()
+    if ext not in MEDIA_EXTS:
+        raise HTTPException(400, f"仅支持 {'/'.join(MEDIA_EXTS)}")
+    data = await file.read()
+    if len(data) > 200 * 1024 * 1024:
+        raise HTTPException(413, "文件超过 200MB 上限")
+    target = _media_dir() / name
+    target.write_bytes(data)
+    logger.info(f"上传背景素材: {name} ({len(data)} bytes)")
+    return {"name": name, "size": len(data)}
+
+
+_TRANSCODE_STATE: dict = {}  # name -> {phase, percent, error}
+
+
+@app.get("/api/media/thumb")
+async def media_thumb(name: str = ""):
+    """视频缩略图：ffmpeg 抽第 1 帧缓存为 jpg。无 ffmpeg / 非视频 → 404（前端用图标兜底）"""
+    if not name or "/" in name or "\\" in name or ".." in name:
+        raise HTTPException(400, "非法文件名")
+    target = _media_dir() / name
+    if not target.is_file() or target.suffix.lower() not in VIDEO_EXTS:
+        raise HTTPException(404, "仅视频支持抽帧缩略图")
+    ff = _find_ffmpeg()
+    if not ff:
+        raise HTTPException(404, "未找到 ffmpeg（设置 MATH_FFMPEG 或加入 PATH 后可用）")
+    cache_dir = PROJECT_ROOT / ".cache" / "thumbs"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    thumb = cache_dir / (name + ".jpg")
+    if not thumb.exists():
+        proc = await asyncio.create_subprocess_exec(
+            ff, "-y", "-ss", "0.5", "-i", str(target), "-frames:v", "1",
+            "-q:v", "4", "-vf", "scale=480:-2", str(thumb),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        if not thumb.exists():
+            raise HTTPException(500, "抽帧失败")
+    return FileResponse(str(thumb))
+
+
+@app.post("/api/media/transcode")
+async def transcode_media(body: dict):
+    """把视频转码为低帧率版（dsh 同款思路：4K120→24fps 解码占用线性下降）。
+    无 ffmpeg 或已在转码 → 返回当前状态；完成后前端改用转码版 URL。"""
+    name = body.get("name", "") if isinstance(body, dict) else ""
+    fps = int(body.get("fps", 24) or 24) if isinstance(body, dict) else 24
+    fps = max(5, min(60, fps))
+    if not name or "/" in name or "\\" in name or ".." in name:
+        raise HTTPException(400, "非法文件名")
+    target = _media_dir() / name
+    if not target.is_file() or target.suffix.lower() not in VIDEO_EXTS:
+        raise HTTPException(404, "仅视频支持转码")
+    ff = _find_ffmpeg()
+    if not ff:
+        return {"name": name, "phase": "skipped", "error": "未找到 ffmpeg"}
+    st = _TRANSCODE_STATE.get(name)
+    if st and st["phase"] in ("working",):
+        return {"name": name, **st}
+    out_dir = PROJECT_ROOT / ".cache" / "transcoded"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{name}.{fps}fps.mp4"
+    if out.exists():
+        _TRANSCODE_STATE[name] = {"phase": "ready", "percent": 100, "error": None, "file": out.name}
+        return {"name": name, **_TRANSCODE_STATE[name]}
+    _TRANSCODE_STATE[name] = {"phase": "working", "percent": 0, "error": None, "file": out.name}
+
+    async def _run():
+        proc = await asyncio.create_subprocess_exec(
+            ff, "-y", "-i", str(target), "-vf", f"fps={fps}", "-c:v", "libx264",
+            "-preset", "veryfast", "-crf", "26", "-an", "-progress", "pipe:1", "-nostats", str(out),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        total_secs = None
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", "ignore").strip()
+            if text.startswith("out_time_us="):
+                try:
+                    us = int(text.split("=", 1)[1])
+                    if total_secs:
+                        _TRANSCODE_STATE[name]["percent"] = min(99, int(us / 1_000_000 / total_secs * 100))
+                except Exception:
+                    pass
+            elif text.startswith("duration=") or text.startswith("out_time_ms="):
+                try:
+                    ms = int(text.split("=", 1)[1])
+                    if total_secs:
+                        _TRANSCODE_STATE[name]["percent"] = min(99, int(ms / 1000 / total_secs * 100))
+                except Exception:
+                    pass
+        await proc.wait()
+        if out.exists() and out.stat().st_size > 0:
+            _TRANSCODE_STATE[name] = {"phase": "ready", "percent": 100, "error": None, "file": out.name}
+        else:
+            _TRANSCODE_STATE[name] = {"phase": "error", "percent": 0, "error": "转码失败", "file": None}
+
+    asyncio.create_task(_run())
+    return {"name": name, **_TRANSCODE_STATE[name]}
+
+
+@app.get("/api/media/transcode-status")
+async def transcode_status(name: str = ""):
+    """查询转码进度（phase: idle/working/ready/error/skipped + percent）"""
+    if not name:
+        return {"phase": "idle", "percent": 0}
+    st = _TRANSCODE_STATE.get(name) or {"phase": "idle", "percent": 0, "error": None, "file": None}
+    return {"name": name, **st}
+
+
+@app.get("/api/media/transcoded")
+async def get_transcoded(name: str = ""):
+    """返回转码产物（.cache/transcoded 下）"""
+    if not name or "/" in name or "\\" in name or ".." in name:
+        raise HTTPException(400, "非法文件名")
+    target = PROJECT_ROOT / ".cache" / "transcoded" / name
+    if not target.is_file():
+        raise HTTPException(404, f"转码产物不存在: {target}")
+    return FileResponse(str(target))
+
+
+# ---------- Wallpaper Engine 壁纸库（dsh 同款：直接读 Steam workshop 目录） ----------
+WE_APPID = "431960"
+WE_INSTALL = Path(r"C:\Program Files (x86)\Steam\steamapps\common\wallpaper_engine")
+WE_RATING_ORDER = {"unrated": 0, "everyone": 1, "pg13": 2, "mature": 3}
+
+
+def _steam_library_dirs() -> list:
+    """解析 libraryfolders.vdf 拿所有 Steam 库路径（非默认盘也能找到）。
+    默认库 = vdf 所在 steamapps 的上一级；其余库读 "path" 字段。"""
+    dirs, seen = [], set()
+    vdf_paths = [
+        WE_INSTALL.parents[1] / "libraryfolders.vdf",   # C:\...\Steam\steamapps\libraryfolders.vdf
+        Path.home() / "Steam" / "steamapps" / "libraryfolders.vdf",
+    ]
+    env_vdf = os.environ.get("MATH_STEAM_VDF")
+    if env_vdf:
+        vdf_paths.insert(0, Path(env_vdf))
+    for vdf in vdf_paths:
+        if not vdf.is_file() or str(vdf) in seen:
+            continue
+        seen.add(str(vdf))
+        root = vdf.parent.parent  # steamapps/.. → Steam 根（默认库）
+        if root.is_dir() and str(root) not in seen:
+            seen.add(str(root))
+            dirs.append(root)
+        try:
+            text = vdf.read_text(encoding="utf-8", errors="ignore")
+            for m in re.finditer(r'"path"\s+"([^"]+)"', text):
+                p = Path(m.group(1))
+                if p.is_dir() and str(p) not in seen:
+                    seen.add(str(p))
+                    dirs.append(p)
+        except Exception:
+            pass
+    return dirs
+
+
+_WE_INV_CACHE = {"t": 0.0, "payload": None}
+
+
+def _scan_we_wallpapers() -> list:
+    """扫描 WE 壁纸库（workshop/content/431960 + WE 自带 projects），读 project.json 出清单。
+    短 TTL 缓存（10s），与 dsh 的 inventory 缓存同思路。"""
+    now = time.time()
+    if _WE_INV_CACHE["payload"] is not None and now - _WE_INV_CACHE["t"] < 10:
+        return _WE_INV_CACHE["payload"]
+    roots = []
+    for lib in _steam_library_dirs():
+        ws = lib / "steamapps" / "workshop" / "content" / WE_APPID
+        if ws.is_dir():
+            roots.append(ws)
+    for sub in ("projects", "projects/defaultprojects", "projects/myprojects"):
+        p = WE_INSTALL / sub
+        if p.is_dir():
+            roots.append(p)
+    wallpapers, seen = [], set()
+    for root in roots:
+        try:
+            entries = list(root.iterdir())
+        except Exception:
+            continue
+        for d in entries:
+            if not d.is_dir():
+                continue
+            pj = d / "project.json"
+            if not pj.is_file():
+                continue
+            try:
+                j = json.loads(pj.read_text(encoding="utf-8", errors="ignore"))
+            except Exception:
+                continue
+            wid = str(j.get("workshopid") or d.name)
+            if wid in seen:
+                continue
+            seen.add(wid)
+            wtype = (j.get("type") or "").lower()
+            if wtype not in ("video", "scene", "web", "image"):
+                continue  # application 等无法嵌入，跳过
+            rating = (j.get("contentrating") or "unrated").lower()
+            if rating not in WE_RATING_ORDER:
+                rating = "unrated"
+            wallpapers.append({
+                "id": wid,
+                "title": j.get("title") or d.name,
+                "type": wtype,
+                "rating": rating,
+                "preview": j.get("preview") or "preview.jpg",
+                "file": j.get("file") or "",
+                "dir": str(d),
+            })
+    wallpapers.sort(key=lambda w: (WE_RATING_ORDER.get(w["rating"], 0), w["title"].lower()))
+    _WE_INV_CACHE.update(t=now, payload=wallpapers)
+    return wallpapers
+
+
+def _find_we_wallpaper(wid: str):
+    if not wid or "/" in wid or "\\" in wid:
+        return None
+    for w in _scan_we_wallpapers():
+        if w["id"] == wid:
+            return w
+    return None
+
+
+@app.get("/api/we/inventory")
+async def we_inventory():
+    """WE 壁纸库清单（id/title/type/rating/preview/file），供前端壁纸选择器使用"""
+    return {"wallpapers": _scan_we_wallpapers()}
+
+
+@app.get("/api/we/preview")
+async def we_preview(id: str = ""):
+    """WE 壁纸预览图（preview.jpg），缩略图网格用"""
+    wp = _find_we_wallpaper(id)
+    if not wp:
+        raise HTTPException(404, "壁纸不存在")
+    target = Path(wp["dir"]) / wp["preview"]
+    if not target.is_file():
+        raise HTTPException(404, "预览图不存在")
+    return FileResponse(str(target))
+
+
+@app.get("/api/we/file")
+async def we_file(id: str = ""):
+    """WE 壁纸主文件：视频返回 mp4 直接播；scene/web/image 返回 preview 静态帧
+    （dsh 解析 .pkg 抠主纹理，这里务实用 preview，零解析成本）"""
+    wp = _find_we_wallpaper(id)
+    if not wp:
+        raise HTTPException(404, "壁纸不存在")
+    if wp["type"] == "video" and wp["file"]:
+        target = Path(wp["dir"]) / wp["file"]
+        if target.is_file():
+            return FileResponse(str(target))
+    target = Path(wp["dir"]) / wp["preview"]
+    if not target.is_file():
+        raise HTTPException(404, "壁纸文件不存在")
+    return FileResponse(str(target))
+
+
 @app.post("/api/reset")
 async def reset_thread(thread_id: str = DEFAULT_THREAD_ID):
+    _guard_ws_mutation()
+    set_workspace(thread_id)
     try:
         checkpointer.delete_thread(thread_id)
     except Exception:
         # 线程不存在时删除会抛错, 忽略即可
         pass
     return {"status": "reset", "thread_id": thread_id}
+
+
+# ---------- 题目工作区管理（多题隔离：workspaces/{题目id}/ + index.json 注册表） ----------
+WORKSPACES_ROOT = PROJECT_ROOT / "workspaces"
+WS_INDEX_PATH = WORKSPACES_ROOT / "index.json"
+QUESTION_EXTS = (".txt", ".md", ".pdf")
+DATASET_EXTS = (".csv", ".tsv", ".xlsx", ".xls", ".json", ".jsonl")
+
+
+def _ws_dir(ws_id: str) -> Path:
+    """校验题目 id 并返回其工作区目录（不存在则创建；5 个标准子目录一并建齐，
+    防止新建题目未上传文件直接运行时 load_problem/read_dataset 抛 FileNotFoundError）"""
+    if not ws_id or "/" in ws_id or "\\" in ws_id or ".." in ws_id:
+        raise HTTPException(400, "非法题目 id")
+    d = WORKSPACES_ROOT / ws_id
+    d.mkdir(parents=True, exist_ok=True)
+    for sub in ("question", "dataset", "paper", "code", "photo"):
+        (d / sub).mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _load_workspaces() -> dict:
+    try:
+        if WS_INDEX_PATH.exists():
+            return json.loads(WS_INDEX_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_workspaces(ws: dict) -> None:
+    WORKSPACES_ROOT.mkdir(parents=True, exist_ok=True)
+    WS_INDEX_PATH.write_text(json.dumps(ws, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _thread_has_state(ws_id: str) -> bool:
+    """该题是否有未结束的线程状态（有→前端显示「继续运行」而非「开始运行」）"""
+    try:
+        return checkpointer.get_tuple({"configurable": {"thread_id": ws_id}}) is not None
+    except Exception:
+        return False
+
+
+def _ws_info(ws_id: str, meta: dict) -> dict:
+    d = WORKSPACES_ROOT / ws_id
+
+    def _names(p: Path) -> list:
+        if not p.is_dir():
+            return []
+        return sorted(f.name for f in p.iterdir() if f.is_file())
+
+    return {
+        "id": ws_id,
+        "title": meta.get("title") or ws_id,
+        "createdAt": meta.get("createdAt", ""),
+        "questionFiles": _names(d / "question"),
+        "datasetFiles": _names(d / "dataset"),
+        "hasState": _thread_has_state(ws_id),
+    }
+
+
+@app.get("/api/workspaces")
+async def list_workspaces():
+    """题目列表（含每题的 question/dataset 文件与运行状态）；注册表缺失的目录也补列出来"""
+    ws = _load_workspaces()
+    if WORKSPACES_ROOT.is_dir():
+        for d in WORKSPACES_ROOT.iterdir():
+            if d.is_dir() and d.name != "index.json" and d.name not in ws:
+                ws[d.name] = {"title": d.name, "createdAt": ""}
+    return {"workspaces": [_ws_info(i, m) for i, m in ws.items()], "current": get_workspace()}
+
+
+@app.post("/api/workspaces")
+async def create_workspace(body: dict):
+    """新建题目：title 必填；id 由 title 安全化生成（同 title 复用）"""
+    title = (body.get("title") or "").strip() if isinstance(body, dict) else ""
+    if not title:
+        raise HTTPException(400, "题目标题不能为空")
+    ws_id = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "_", title)[:60] or "workspace"
+    ws = _load_workspaces()
+    if ws_id not in ws:
+        ws[ws_id] = {"title": title, "createdAt": datetime.now().strftime("%Y-%m-%d %H:%M")}
+        _save_workspaces(ws)
+        _ws_dir(ws_id)
+    return _ws_info(ws_id, ws[ws_id])
+
+
+def _guard_ws_mutation() -> None:
+    """运行中(_run_lock 被持有)禁止切换/删除/重置题目：
+    set_workspace 是进程级全局，中途被改会把正在跑的题目产物写进别的工作区（静默污染）。
+    锁在 interrupt 挂起/完成/出错后都会释放，等待人工输入时不受影响。"""
+    if _run_lock.locked():
+        raise HTTPException(409, "有题目正在运行，请先暂停或等运行结束后再操作题目")
+
+
+@app.post("/api/workspaces/{ws_id}/activate")
+async def activate_workspace(ws_id: str):
+    """切换当前题目（前端切换时调用；运行时会再按 thread_id 自动切）"""
+    _guard_ws_mutation()
+    if ws_id not in _load_workspaces():
+        raise HTTPException(404, "题目不存在")
+    set_workspace(ws_id)
+    return {"current": ws_id}
+
+
+@app.delete("/api/workspaces/{ws_id}")
+async def delete_workspace(ws_id: str):
+    """删除题目：连带工作区目录（含全部产物）+ 线程状态"""
+    _guard_ws_mutation()
+    ws = _load_workspaces()
+    if ws_id not in ws:
+        raise HTTPException(404, "题目不存在")
+    ws.pop(ws_id)
+    _save_workspaces(ws)
+    d = WORKSPACES_ROOT / ws_id
+    if d.is_dir():
+        shutil.rmtree(d, ignore_errors=True)
+    try:
+        checkpointer.delete_thread(ws_id)
+    except Exception:
+        pass
+    if get_workspace() == ws_id:
+        set_workspace("default")
+    return {"status": "deleted", "id": ws_id}
+
+
+@app.post("/api/workspaces/{ws_id}/upload")
+async def upload_workspace_files(ws_id: str, target: str = "question", files: list[UploadFile] = File(...)):
+    """上传文件到指定题的目标目录：target=question（题目文件）| dataset（数据文件）"""
+    if target not in ("question", "dataset"):
+        raise HTTPException(400, "target 只能是 question / dataset")
+    _ws_dir(ws_id)
+    d = WORKSPACES_ROOT / ws_id / target
+    d.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for f in files:
+        name = f.filename or ""
+        if not name or "/" in name or "\\" in name:
+            continue
+        (d / name).write_bytes(await f.read())
+        saved.append(name)
+    ws = _load_workspaces()
+    if ws_id not in ws:
+        ws[ws_id] = {"title": ws_id, "createdAt": datetime.now().strftime("%Y-%m-%d %H:%M")}
+        _save_workspaces(ws)
+    info = _ws_info(ws_id, ws[ws_id])
+    info["saved"] = saved
+    return info
+
+
+def _migrate_legacy_workspace():
+    """首次启动：把项目根下的 question/dataset/paper/code/photo 迁入 workspaces/default/，
+    保证旧数据在新模型下不丢。只移动文件，目录结构保留。"""
+    ws_dir = WORKSPACES_ROOT / "default"
+    ws_dir.mkdir(parents=True, exist_ok=True)
+    if any(ws_dir.iterdir()):
+        return
+    moved = []
+    for name in ("question", "dataset", "paper", "code", "photo"):
+        src = PROJECT_ROOT / name
+        if src.is_dir():
+            dst = ws_dir / name
+            dst.mkdir(parents=True, exist_ok=True)
+            for f in src.iterdir():
+                if f.is_file():
+                    try:
+                        shutil.move(str(f), str(dst / f.name))
+                        moved.append(f"{name}/{f.name}")
+                    except Exception:
+                        pass
+    if moved:
+        ws = _load_workspaces()
+        ws.setdefault("default", {"title": "默认题目", "createdAt": datetime.now().strftime("%Y-%m-%d %H:%M")})
+        _save_workspaces(ws)
+        logger.info(f"已迁移旧工作区数据到 workspaces/default/：{len(moved)} 个文件")
+    for sub in ("question", "dataset", "paper", "code", "photo"):
+        (ws_dir / sub).mkdir(parents=True, exist_ok=True)
+
+
+_migrate_legacy_workspace()
 
 
 if __name__ == "__main__":
