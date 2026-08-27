@@ -1,5 +1,6 @@
 from langchain_core.tools import tool, ToolException
 from langgraph.prebuilt import ToolNode
+from langgraph.config import get_config
 import os
 import shlex
 import subprocess
@@ -19,20 +20,36 @@ search = TavilySearchResults(max_results=2)
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 ALLOWED_DIRS = {"code", "paper", "photo", "dataset"}
 
-# ── 多题目隔离：工作区按题目分目录（workspaces/{题目id}/），set_workspace 切换当前题目 ──
+# ── 多题目隔离：工作区按题目分目录（workspaces/{题目id}/）──
+# 当前运行的题目优先从 LangGraph 运行配置的 thread_id 解析（按 thread 隔离、并发安全）；
+# set_workspace/_CURRENT_WS 仅作为"未在运行中/读不到配置"时的兜底默认，保持向后兼容。
 _CURRENT_WS = "default"
 
 def set_workspace(ws_id: str) -> None:
-    """切换当前题目工作区（线程串行执行，无并发问题）"""
+    """设置兜底工作区（供 CLI/后端在运行外切换浏览位置；运行中请用 thread_id）"""
     global _CURRENT_WS
     _CURRENT_WS = (ws_id or "default").strip() or "default"
 
 def get_workspace() -> str:
+    return _active_ws_id()
+
+def _active_ws_id() -> str:
+    """解析当前应使用的工作区 id：
+    ① 运行中（节点/工具内）→ 读当前运行的 config 里的 thread_id，天然按线程隔离、可并发；
+    ② 运行外或读不到 config（get_config 在非运行上下文会抛 RuntimeError）→ 回退全局兜底。
+    """
+    try:
+        cfg = get_config()
+        tid = cfg.get("configurable", {}).get("thread_id", "")
+        if tid:
+            return str(tid)
+    except Exception:
+        pass
     return _CURRENT_WS
 
 def ws_root() -> Path:
-    """当前题目的工作区根目录（question/dataset/paper/code/photo 都在其下）"""
-    return WORKSPACE_ROOT / "workspaces" / _CURRENT_WS
+    """当前（按 thread 隔离的）工作区根目录（question/dataset/paper/code/photo 都在其下）"""
+    return WORKSPACE_ROOT / "workspaces" / _active_ws_id()
 
 #解析并校验工作区内的目标路径,非法路径直接抛 ValueError 交由 LangGraph 重试
 def _resolve_path(work_dir: str, rel_path: str) -> Path:

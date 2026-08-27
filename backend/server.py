@@ -209,8 +209,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 单进程内同一线程的多次运行必须串行, 防止状态交错
-_run_lock = asyncio.Lock()
+# ── 按题目(thread_id)粒度加锁: 不同题目可并行跑, 同一题目内必须串行(防止同题交错) ──
+# 工作区已按 thread 隔离(见 src/tool._active_ws_id), 不同题互不写错目录;
+# 同一题目仍用一把自己的锁串行化若干次请求(含 interrupt 恢复), 保 checkpointer 状态有序。
+_thread_run_locks: dict[str, asyncio.Lock] = {}
+
+def _lock_for(thread_id: str) -> asyncio.Lock:
+    """取指定题目的运行锁(不存在则创建)"""
+    lk = _thread_run_locks.get(thread_id)
+    if lk is None:
+        lk = asyncio.Lock()
+        _thread_run_locks[thread_id] = lk
+    return lk
+
+def _thread_is_running(thread_id: str) -> bool:
+    """该题目当前是否正在运行"""
+    lk = _thread_run_locks.get(thread_id)
+    return bool(lk and lk.locked())
+
+def _release_run_lock(thread_id: str) -> None:
+    """运行结束后从表里清理空闲锁, 避免历史题目无限堆积"""
+    lk = _thread_run_locks.get(thread_id)
+    if lk is not None and not lk.locked():
+        _thread_run_locks.pop(thread_id, None)
 
 
 class ModelName(BaseModel):
@@ -327,7 +348,7 @@ async def _stream_events(resume: Optional[str], thread_id: str, model: Optional[
                         for it in its:
                             out_q.put_nowait(("chunk", _sse({"type": "interrupt", "node": node, "value": it["value"]})))
                         out_q.put_nowait(("chunk", _sse({"type": "suspended"})))
-                        out_q.put_nowait(("stop", None))  # 终止信号:主循环 break → 释放 _run_lock → 响应正常结束
+                        out_q.put_nowait(("stop", None))  # 终止信号:主循环 break → 释放本题目锁 → 响应正常结束
                         stop = True
                         break
                     out_q.put_nowait(("chunk", _sse({"type": "update", "node": node, "data": _simplify(payload)})))
@@ -352,8 +373,10 @@ async def _stream_events(resume: Optional[str], thread_id: str, model: Optional[
     stopped = False
     pump_task = None
     try:
-        async with _run_lock:
-            # 题目隔离：thread_id 即题目 id，把 agent 的工作区切到该题的 workspaces/{id}/
+        run_lock = _lock_for(thread_id)
+        async with run_lock:
+            # 题目隔离：thread_id 即题目 id。运行内工作区由 agent 按 config.thread_id 自动解析;
+            # set_workspace 仅给"运行外浏览文件"的接口当兜底默认。
             set_workspace(thread_id)
             # 应用本次运行指定的模型（前端下拉框选择）
             if model:
@@ -414,6 +437,7 @@ async def _stream_events(resume: Optional[str], thread_id: str, model: Optional[
     finally:
         if pump_task is not None and not pump_task.done():
             pump_task.cancel()
+        _release_run_lock(thread_id)
         logger.remove(sink_id)
 
 
@@ -895,7 +919,7 @@ async def we_file(id: str = ""):
 
 @app.post("/api/reset")
 async def reset_thread(thread_id: str = DEFAULT_THREAD_ID):
-    _guard_ws_mutation()
+    _guard_ws_mutation(thread_id)
     set_workspace(thread_id)
     try:
         checkpointer.delete_thread(thread_id)
@@ -990,18 +1014,18 @@ async def create_workspace(body: dict):
     return _ws_info(ws_id, ws[ws_id])
 
 
-def _guard_ws_mutation() -> None:
-    """运行中(_run_lock 被持有)禁止切换/删除/重置题目：
-    set_workspace 是进程级全局，中途被改会把正在跑的题目产物写进别的工作区（静默污染）。
+def _guard_ws_mutation(ws_id: str) -> None:
+    """只阻止对"正在运行的同一题目"的切换/删除/重置：
+    运行内工作区已按 thread 隔离(_active_ws_id 读 config.thread_id)，所以并发跑不同题时，
+    操作 A 题不会被 B 题在跑而阻塞；但该题自己正在跑时禁止删/重置，避免清空进行中的产物。
     锁在 interrupt 挂起/完成/出错后都会释放，等待人工输入时不受影响。"""
-    if _run_lock.locked():
-        raise HTTPException(409, "有题目正在运行，请先暂停或等运行结束后再操作题目")
+    if _thread_is_running(ws_id):
+        raise HTTPException(409, f"题目 {ws_id} 正在运行，请先暂停或等运行结束后再操作")
 
 
 @app.post("/api/workspaces/{ws_id}/activate")
 async def activate_workspace(ws_id: str):
-    """切换当前题目（前端切换时调用；运行时会再按 thread_id 自动切）"""
-    _guard_ws_mutation()
+    """切换当前浏览题目（运行内工作区由 agent 按 thread 自动解析，这里只切浏览兜底位置）"""
     if ws_id not in _load_workspaces():
         raise HTTPException(404, "题目不存在")
     set_workspace(ws_id)
@@ -1011,7 +1035,7 @@ async def activate_workspace(ws_id: str):
 @app.delete("/api/workspaces/{ws_id}")
 async def delete_workspace(ws_id: str):
     """删除题目：连带工作区目录（含全部产物）+ 线程状态"""
-    _guard_ws_mutation()
+    _guard_ws_mutation(ws_id)
     ws = _load_workspaces()
     if ws_id not in ws:
         raise HTTPException(404, "题目不存在")
