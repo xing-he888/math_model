@@ -100,6 +100,11 @@ MODEL_REGISTRY = {
 
 DEFAULT_MODEL = "deepseek"
 
+# 模型实例缓存：按 (模型key, 角色, api_key) 复用同一个无状态实例。
+# 保证多题并行(共用同一模型)时，set_model 不会反复 new 对象造成模块级绑定竞态；
+# api_key 一旦变化(例如请求带新 key)会命中不同缓存项，避免拿到过期 key。
+_MODEL_CACHE: dict = {}
+
 
 def get_model(name: str = None, role: str = "text"):
     """根据名字（或 MATH_MODEL 环境变量）返回一个可用的 ChatModel。
@@ -119,23 +124,32 @@ def get_model(name: str = None, role: str = "text"):
     tcfg = cfg.get("thinking")
     extra = tcfg["on"] if (tcfg and role == "text") else (tcfg["off"] if tcfg else None)
 
+    cache_key = (key, role, api_key, bool(extra) if extra is not None else None)
+    cached = _MODEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     if key == "deepseek":
-        return ChatDeepSeek(
+        instance = ChatDeepSeek(
             model=cfg["model"],
             base_url=cfg["base_url"],
             api_key=api_key,
             extra_body=extra,
         )
+        _MODEL_CACHE[cache_key] = instance
+        return instance
 
     if key == "openrouter":
         if ChatOpenRouter is None:
             raise RuntimeError(
                 "使用 OpenRouter 需要安装 langchain-openrouter，请执行：pip install -U langchain-openrouter"
             )
-        return ChatOpenRouter(
+        instance = ChatOpenRouter(
             model=cfg["model"],
             api_key=api_key,
         )
+        _MODEL_CACHE[cache_key] = instance
+        return instance
 
     if ChatOpenAI is None:
         raise RuntimeError(
@@ -145,12 +159,14 @@ def get_model(name: str = None, role: str = "text"):
     if extra is not None:
         kwargs["extra_body"] = extra
     try:
-        return ChatOpenAI(**kwargs)
+        instance = ChatOpenAI(**kwargs)
     except (TypeError, ValueError):
         # 旧版 langchain-openai 不支持 extra_body（pydantic 抛 ValidationError=ValueError 子类）：
         # 退回不传思考参数，等效于各模型默认行为
         kwargs.pop("extra_body", None)
-        return ChatOpenAI(**kwargs)
+        instance = ChatOpenAI(**kwargs)
+    _MODEL_CACHE[cache_key] = instance
+    return instance
 
 
 def get_struct_model():
