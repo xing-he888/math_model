@@ -117,14 +117,14 @@ MODEL_REGISTRY = {
         "thinking": THINKING_QWEN,
     },
     "kimi": {
-        "label": "Kimi (Moonshot)",
+        "label": "Kimi",
         "key_label": "Kimi API Key (Moonshot)",
         "base_url": "https://api.moonshot.cn/v1",
         "model": "moonshot-v1-8k",
         "api_key_env": "MOONSHOT_API_KEY",
     },
     "mimo": {
-        "label": "MiniMax (Mimo)",
+        "label": "MiniMax",
         "key_label": "MiniMax API Key",
         "base_url": "https://api.minimax.io/v1",
         "model": "MiniMax-Text-01",
