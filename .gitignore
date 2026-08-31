@@ -11,3 +11,15 @@ __pycache__/
 # 前端构建产物与依赖(体积大, 不提交)
 frontend/node_modules/
 frontend/dist/
+
+# AI 工具本地状态
+.workbuddy/
+.zcode/
+
+# 前端 TS 增量编译产物
+frontend/tsconfig.tsbuildinfo
+
+# 各题目工作区的运行时产物不入库(仅保留 default 样例与索引)
+workspaces/*
+!workspaces/index.json
+!workspaces/default/

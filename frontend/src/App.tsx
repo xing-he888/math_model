@@ -11,6 +11,9 @@ import {
   imageUrl,
   fetchModels,
   fetchModelConfig,
+  fetchUsage,
+  listPdfs,
+  pdfUrl,
   saveKeys,
   fetchUiConfig,
   saveUiConfig,
@@ -29,6 +32,8 @@ import {
   deleteWorkspace,
   activateWorkspace,
   uploadWorkspaceFiles,
+  deleteArtifact,
+  deleteWsFile,
   DEFAULT_UI,
   FALLBACK_MODELS,
   type SseEvent,
@@ -37,6 +42,8 @@ import {
   type WorkspaceFile,
   type ModelOption,
   type UiConfig,
+  type UsageStats,
+  type PdfInfo,
 } from "./api";
 import "./App.css";
 import bgImage from "./assets/bg-miku.jpg";
@@ -44,6 +51,8 @@ import bgImage from "./assets/bg-miku.jpg";
 /* dsh 同款配色预设（dsh-wallpaper-engine ACCENT_PRESETS / GLASS_COLOR_PRESETS） */
 const ACCENT_PRESETS = ["#4f8cff", "#67DCE7", "#DD8FAC", "#F3B75F", "#F1717F", "#CBE77D"];
 const GLASS_COLOR_PRESETS = ["#ffffff", "#0d1524", "#67DCE7", "#DD8FAC", "#F3B75F", "#F1717F"];
+/* 文字主色预设(""=默认由单独按钮承载);深浅都给了, 配深色玻璃或浅色玻璃都能搭 */
+const TEXT_COLOR_PRESETS = ["#16233c", "#0f172a", "#334155", "#f8fafc", "#e2e8f0", "#cbd5e1"];
 const IMAGE_EXT = /\.(png|jpe?g|gif|bmp|webp)$/i;
 const VIDEO_EXT = /\.(mp4|webm)$/i;
 const RATING_LABEL: Record<string, string> = {
@@ -58,6 +67,7 @@ const NODE_LABELS: Record<string, string> = {
   question_structed: "解析问题结构",
   read_dataset: "读取数据集",
   modeling: "建模分析",
+  debate_plan: "方案辩论",
   tool_node: "工具执行",
   review_modeling_analysis: "建模审核",
   send_problem_index: "分发问题",
@@ -90,6 +100,7 @@ const NODE_TO_STEP: Record<string, number> = {
   question_structed: 1,
   read_dataset: 1,
   modeling: 2,
+  debate_plan: 3,
   tool_node: 2,
   review_modeling_analysis: 3,
   send_problem_index: 4,
@@ -115,10 +126,19 @@ const fmtElapsed = (sec: number) => {
       : `${s}s`;
 };
 
+/** token 数缩写：48231 → 48.2k */
+const fmtTokens = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+
+/** 文件大小缩写：1234567 → 1.2MB */
+const fmtSize = (n: number) =>
+  n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)}MB` : `${Math.max(1, Math.round(n / 1024))}KB`;
+
 type LogItem =
   | { id: number; t: string; kind: "node"; label: string; method?: string }
   | { id: number; t: string; kind: "tool"; label: string; content: string }
   | { id: number; t: string; kind: "ai"; label: string; content: string }
+  | { id: number; t: string; kind: "thinking"; label: string; content: string }
+  | { id: number; t: string; kind: "ai_stream"; label: string; content: string }
   | { id: number; t: string; kind: "interrupt"; label: string; question: string }
   | { id: number; t: string; kind: "user"; label: string; content: string }
   | { id: number; t: string; kind: "info"; label: string; content: string }
@@ -126,6 +146,22 @@ type LogItem =
   | { id: number; t: string; kind: "error"; label: string; content: string };
 
 type Status = "idle" | "running" | "awaiting_input" | "done" | "error";
+
+/** 每题一个状态桶:切换题目只是换视图,各题的运行与日志互不干扰 */
+interface WsState {
+  logs: LogItem[];
+  status: Status;
+  question: string | null;   // 当前待回答的提问(卡片+输入占位);暂停提示也走这里
+  step: number;              // 工作流步骤(0=未开始/1-6)
+  finalSummary: string;
+  runReports: any[];
+  runStart: number | null;   // 本轮运行起点(算 elapsed 用;续跑保留旧值=计时延续)
+}
+
+const EMPTY_WS: WsState = {
+  logs: [], status: "idle", question: null, step: 0,
+  finalSummary: "", runReports: [], runStart: null,
+};
 
 type DistributiveOmit<T, K extends keyof any> = T extends any ? Omit<T, K> : never;
 
@@ -161,13 +197,21 @@ export default function App() {
   const [wsUploading, setWsUploading] = useState(false);
   const wsQRef = useRef<HTMLInputElement | null>(null);  // 题目文件
   const wsDRef = useRef<HTMLInputElement | null>(null);  // 数据文件
-  const [status, setStatus] = useState<Status>("idle");
-  const [logs, setLogs] = useState<LogItem[]>([]);
-  const [question, setQuestion] = useState<string | null>(null);
+  const [wsDdOpen, setWsDdOpen] = useState(false);       // 顶栏题目下拉(自绘, 行内可删题)
+  const wsDdRef = useRef<HTMLDivElement | null>(null);
+  // —— 多题并行:每题一个状态桶,切换题目只是换视图,绝不掐断运行 ——
+  // 已知限制(留档): a) 并行两题选不同模型时,后启动运行的 set_model 会影响先启动题的后续调用
+  // (后端全局模型实例为既有机制,改动需动 src/agent.py); b) 日志在前端内存,刷新页面会丢。
+  const [wsMap, setWsMap] = useState<Record<string, WsState>>({});
+  const wsMapRef = useRef<Record<string, WsState>>({});
+  wsMapRef.current = wsMap;
   const [answer, setAnswer] = useState("");
-  const [finalSummary, setFinalSummary] = useState("");
-  const [runReports, setRunReports] = useState<any[]>([]);
   const [backendOk, setBackendOk] = useState<boolean | null>(null);
+  // Token 消耗/缓存命中统计（/api/usage 轮询；后端旧版本无该接口时保持 null，界面自动隐藏该行）
+  const [usage, setUsage] = useState<UsageStats | null>(null);
+  // PDF 产物列表与当前预览
+  const [pdfs, setPdfs] = useState<PdfInfo[]>([]);
+  const [viewPdf, setViewPdf] = useState<PdfInfo | null>(null);
   const [papers, setPapers] = useState<WorkspaceFile[]>([]);
   const [codes, setCodes] = useState<WorkspaceFile[]>([]);
   const [images, setImages] = useState<WorkspaceFile[]>([]);
@@ -204,52 +248,191 @@ export default function App() {
   const [weWallpapers, setWeWallpapers] = useState<WeWallpaper[]>([]);
   const [weLibTab, setWeLibTab] = useState<"local" | "we">("local");
   const [weSearch, setWeSearch] = useState("");
-  const abortRef = useRef<AbortController | null>(null);
+  // 每题独立的运行控制器/运行代数/暂停标记(切题互不影响, 后台题继续跑)
+  const abortMapRef = useRef<Record<string, AbortController | null>>({});
+  const epochMapRef = useRef<Record<string, number>>({});
+  const pausedMapRef = useRef<Record<string, boolean>>({});
   const logBoxRef = useRef<HTMLDivElement>(null);
-  const statusRef = useRef<Status>(status);
-  statusRef.current = status;
-  // 运行代数：切题/重置/新运行时自增，旧运行残余事件按代数丢弃，防串台
-  const epochRef = useRef(0);
-  // 暂停标记：暂停 = abort 杀图，线程无挂起 interrupt，无法断点续跑，「下一步」须重新开始
-  const pausedRef = useRef(false);
-  // 设计稿三栏布局：当前工作流步骤(0=未开始/1-6) + 会话计时
-  const [step, setStep] = useState(0);
+  const currentWsRef = useRef(currentWs);
+  currentWsRef.current = currentWs;
   const [elapsed, setElapsed] = useState(0);
-  const runStartRef = useRef<number | null>(null);
+
+  // 当前题的状态桶——界面全部读这里的派生值
+  const cur: WsState = wsMap[currentWs] ?? EMPTY_WS;
+  const { logs, status, question, step, finalSummary, runReports } = cur;
+  // 可拖拽分栏：左右栏列宽由分隔条拖动实时调整，中栏自适应剩余空间
+  const [leftWidth, setLeftWidth] = useState(232);
+  const [rightWidth, setRightWidth] = useState(312);
+  const splitDragRef = useRef<{
+    side: "left" | "right";
+    startX: number;
+    startWidth: number;
+  } | null>(null);
   const chatInputRef = useRef<HTMLTextAreaElement | null>(null);
   const papersSecRef = useRef<HTMLDivElement | null>(null);
   const imagesSecRef = useRef<HTMLDivElement | null>(null);
 
-  // 会话计时：运行/等待输入期间每秒刷新
-  useEffect(() => {
-    if (status !== "running" && status !== "awaiting_input") return;
-    if (runStartRef.current === null) runStartRef.current = Date.now() - elapsed * 1000;
-    const timer = setInterval(() => {
-      setElapsed(Math.floor((Date.now() - (runStartRef.current ?? Date.now())) / 1000));
-    }, 1000);
-    return () => clearInterval(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status]);
+  // 文档弹窗尺寸: null=走 CSS 默认;拖过之后 inline 生效并记忆(localStorage), 文件/PDF 两个弹窗共用
+  const [docSize, setDocSize] = useState<{ w: number; h: number } | null>(() => {
+    try {
+      const v = JSON.parse(localStorage.getItem("doc-modal-size") || "null");
+      // 恢复值同样钳制合法区间, 防止手改存储后弹出异常尺寸
+      if (v && typeof v.w === "number" && typeof v.h === "number") {
+        return {
+          w: Math.min(window.innerWidth * 0.94, Math.max(420, v.w)),
+          h: Math.min(window.innerHeight * 0.96, Math.max(320, v.h)),
+        };
+      }
+    } catch { /* 存储损坏则忽略, 回落 CSS 默认 */ }
+    return null;
+  });
 
-  // interrupt 挂起时自动聚焦底部输入框
-  useEffect(() => {
-    if (status === "awaiting_input") chatInputRef.current?.focus();
-  }, [status, question]);
-
-  const push = useCallback((item: DistributiveOmit<LogItem, "id" | "t">) => {
-    setLogs((ls) => [...ls, { ...item, id: ++seq, t: now() }]);
+  // 弹窗右下角拖拽调大小: 宽高独立生效, 范围钳在 420x320 ~ 94vw/96vh, 松手写入 localStorage
+  const startDocResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const el = (e.currentTarget as HTMLElement).closest(".modal") as HTMLElement | null;
+    const drag = { x: e.clientX, y: e.clientY, w: el?.offsetWidth ?? 900, h: el?.offsetHeight ?? 700 };
+    const clamp = (w: number, h: number) => ({
+      w: Math.min(window.innerWidth * 0.94, Math.max(420, w)),
+      h: Math.min(window.innerHeight * 0.96, Math.max(320, h)),
+    });
+    let latest = clamp(drag.w, drag.h);
+    const onMove = (ev: MouseEvent) => {
+      latest = clamp(drag.w + (ev.clientX - drag.x), drag.h + (ev.clientY - drag.y));
+      setDocSize(latest);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.classList.remove("doc-resizing");
+      try { localStorage.setItem("doc-modal-size", JSON.stringify(latest)); } catch { /* 忽略 */ }
+    };
+    document.body.classList.add("doc-resizing");
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
   }, []);
 
-  const refreshWorkspace = useCallback(async () => {
+  // 会话计时:当前题运行/等待输入期间每秒刷新(runStart 存桶内,切回运行中的题能对上真实时长)
+  useEffect(() => {
+    if (status !== "running" && status !== "awaiting_input") return;
+    const tick = () => {
+      const rs = wsMapRef.current[currentWs]?.runStart;
+      setElapsed(rs != null ? Math.floor((Date.now() - rs) / 1000) : 0);
+    };
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [status, currentWs]);
+
+  // interrupt 挂起时自动聚焦底部输入框(切到正在等输入的题也会触发)
+  useEffect(() => {
+    if (status === "awaiting_input") chatInputRef.current?.focus();
+  }, [status, question, currentWs]);
+
+  // 自绘题目下拉: 点击面板外自动收起
+  useEffect(() => {
+    if (!wsDdOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      if (wsDdRef.current && !wsDdRef.current.contains(e.target as Node)) setWsDdOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [wsDdOpen]);
+
+  const patchWs = useCallback((id: string, patch: Partial<WsState>) => {
+    setWsMap((prev) => ({ ...prev, [id]: { ...(prev[id] ?? EMPTY_WS), ...patch } }));
+  }, []);
+  // 向指定题的聊天桶追加一条(后台运行题的事件写入它自己的桶,不打扰当前视图)
+  const push = useCallback((id: string, item: DistributiveOmit<LogItem, "id" | "t">) => {
+    setWsMap((prev) => {
+      const s = prev[id] ?? EMPTY_WS;
+      return { ...prev, [id]: { ...s, logs: [...s.logs, { ...item, id: ++seq, t: now() }] } };
+    });
+  }, []);
+
+  // 流式打字: 按 (LLM消息id mid + 节点) 分组追加"思考过程/模型输出"增量;
+  // mid 每次新 LLM 调用必然变化, 分组天然自终, 无需在节点 update 时清空
+  // (清空反而会拆散并行 Send 分支下仍在流式的其他分支的同一条消息)
+  const streamMapRef = useRef<Record<string, { mid: string; node: string; thinkId: number | null; textId: number | null } | null>>({});
+  // 最近一次正文流式所属节点: 节点 update 到达时若匹配则跳过 400 字截断摘要(避免重复)
+  const streamedNodeMapRef = useRef<Record<string, string | null>>({});
+  // 最近一个已实时宣告(推过节点行)的节点: 流式首个增量即宣告节点行+步骤, 不等节点结束;
+  // update 到达时对比去重(并行 Send 分支的多条同名 update 也靠它只推一行) —— 均按题键控
+  const announcedMapRef = useRef<Record<string, string | null>>({});
+
+  const appendStream = useCallback((id: string, ev: SseEvent, kind: "thinking" | "ai_stream") => {
+    const text = ev.text ?? "";
+    if (!text) return;
+    const mid = ev.mid ?? "";
+    const node = ev.node ?? "";
+    let sr = streamMapRef.current[id];
+    if (!sr || sr.mid !== mid || sr.node !== node) {
+      sr = streamMapRef.current[id] = { mid, node, thinkId: null, textId: null };
+    }
+    const idKey = kind === "thinking" ? "thinkId" : "textId";
+    const existing = sr[idKey];
+    if (existing == null) {
+      // 本节点首个增量: 先宣告节点行(气泡出现在节点名之下, 时序正确)
+      if (node && announcedMapRef.current[id] !== node) {
+        announcedMapRef.current[id] = node;
+        push(id, { kind: "node", label: NODE_LABELS[node] ?? node });
+        const st = NODE_TO_STEP[node];
+        if (st) patchWs(id, { step: st });
+      }
+      const nid = ++seq;
+      sr[idKey] = nid;
+      if (kind === "ai_stream") streamedNodeMapRef.current[id] = node;
+      const label = kind === "thinking" ? "思考过程" : (node && NODE_LABELS[node]) || "模型输出";
+      setWsMap((prev) => {
+        const s = prev[id] ?? EMPTY_WS;
+        return { ...prev, [id]: { ...s, logs: [...s.logs, { id: nid, t: now(), kind, label, content: text }] } };
+      });
+    } else {
+      setWsMap((prev) => {
+        const s = prev[id] ?? EMPTY_WS;
+        return {
+          ...prev,
+          [id]: {
+            ...s,
+            logs: s.logs.map((it) =>
+              it.id === existing && (it.kind === "thinking" || it.kind === "ai_stream")
+                ? { ...it, content: (it.content + text).slice(-30000) }
+                : it,
+            ),
+          },
+        };
+      });
+    }
+  }, [push, patchWs]);
+
+  // 产物清单:按题查询(thread_id 参数)——多题并行下全局兜底指针会被后启动的运行占用,不传会串台
+  const refreshWorkspace = useCallback(async (wsId?: string) => {
+    const id = wsId ?? currentWsRef.current;
     const [p, c, im] = await Promise.all([
-      listFiles("paper"),
-      listFiles("code"),
-      listFiles("photo"),
+      listFiles("paper", id),
+      listFiles("code", id),
+      listFiles("photo", id),
     ]);
     setPapers(p.filter((f) => f.name.endsWith(".md")));
     setCodes(c.filter((f) => f.name.endsWith(".py")));
     setImages(im.filter((f) => /\.(png|jpe?g|gif|bmp)$/i.test(f.name)));
-  }, []);
+    // 运行状态为空时回退读 paper/最终总结.md（模拟工作区 / 中断恢复场景）
+    // 运行中不回退: 避免旧文件内容中途回显, 新总结落定前保持占位
+    const s = wsMapRef.current[id] ?? EMPTY_WS;
+    if (!s.finalSummary && s.status !== "running") {
+      readFile("paper", "最终总结.md", id)
+        .then((c) => {
+          if (c && c.trim()) patchWs(id, { finalSummary: c.trim() });
+        })
+        .catch(() => {});
+    }
+  }, [patchWs]);
+
+  // 仅当该题正被查看时才刷新产物面板(后台题的产物留给切回时的 refreshWorkspace)
+  const refreshArtifactsIfVisible = useCallback((id: string) => {
+    if (id === currentWsRef.current) refreshWorkspace(id);
+  }, [refreshWorkspace]);
 
   useEffect(() => {
     checkHealth().then(setBackendOk);
@@ -257,6 +440,17 @@ export default function App() {
     refreshWorkspace();
     return () => clearInterval(timer);
   }, [refreshWorkspace]);
+
+  // Token/缓存命中: 3 秒轮询（与产物刷新同节奏），重置/新运行由后端清零；PDF 清单按题刷新
+  useEffect(() => {
+    fetchUsage().then(setUsage);
+    listPdfs(currentWsRef.current).then(setPdfs);
+    const timer = setInterval(() => {
+      fetchUsage().then(setUsage);
+      listPdfs(currentWsRef.current).then(setPdfs);
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [currentWs]);
 
   // 启动时拉取可选模型与已保存的默认模型（配置一次一直可用）
   // 若后端不可用，回退到内置模型清单，保证下拉框与 API Key 输入永不卡死
@@ -293,6 +487,9 @@ export default function App() {
     const s = document.documentElement.style;
     const blur = uiTheme.glassWindow ? uiTheme.blur : 0; // 玻璃总开关：off → 取消毛玻璃
     s.setProperty("--we-accent", uiTheme.accent);
+    // 文字主色: 用户选了色则全局覆盖 --text, 清空(默认)则回落 :root 主题值
+    if (uiTheme.textColor) s.setProperty("--text", uiTheme.textColor);
+    else s.removeProperty("--text");
     s.setProperty("--we-glass-alpha", String(uiTheme.glassAlpha / 100));
     s.setProperty("--we-glass-color", uiTheme.glassColor);
     s.setProperty("--we-blur", `${blur}px`);
@@ -396,24 +593,17 @@ export default function App() {
   // —— 题目管理：切换/新建/删除/上传（每题的题目、数据、产物、线程状态互相隔离）——
   const switchWs = useCallback(async (id: string) => {
     if (id === currentWs) return;
-    // 先掐断旧 SSE 流（后端会取消旧题的图），再清状态：
-    // 否则旧运行的事件继续推送、后端全局工作区也被占用
-    abortRef.current?.abort();
-    epochRef.current++;          // 旧运行残余事件按代数丢弃，不串台到新题目
-    pausedRef.current = false;
-    setStatus("idle");
-    setLogs([]);
-    setFinalSummary("");
-    setRunReports([]);
-    setSelected(null);
-    setQuestion(null);
-    setAnswer("");
-    setStep(0);
-    setElapsed(0);
-    runStartRef.current = null;
+    // 多题并行:切换只换视图,绝不掐断旧题的 SSE——旧运行继续跑,事件继续写它自己的桶;
+    // 切回时历史与实时进度都在(产物面板由 refreshWorkspace 按题刷新)
     setCurrentWs(id);
+    setAnswer("");
+    // 预览类浮层里嵌着按当前题取的资源(thread_id),切题不关会静默串成新题的同名文件
+    setSelected(null);
+    setZoomImage(null);
+    setViewPdf(null);
+    setElapsed(0); // 若目标题在跑,计时 effect 会立即按它的 runStart 校正
     try { await activateWorkspace(id); } catch { /* 后端离线时本地先切 */ }
-    refreshWorkspace();
+    refreshWorkspace(id);
   }, [currentWs, refreshWorkspace]);
 
   const onCreateWs = useCallback(async () => {
@@ -425,9 +615,9 @@ export default function App() {
       setWorkspaces((prev) => [ws, ...prev.filter((w) => w.id !== ws.id)]);
       await switchWs(ws.id);
       setShowWsModal(false);
-      push({ kind: "info", label: "题目已创建", content: `${ws.title} (${ws.id})` });
+      push(ws.id, { kind: "info", label: "题目已创建", content: `${ws.title} (${ws.id})` });
     } catch (e: any) {
-      push({ kind: "error", label: "新建失败", content: String(e?.message ?? e) });
+      push(currentWsRef.current, { kind: "error", label: "新建失败", content: String(e?.message ?? e) });
     }
   }, [newWsTitle, switchWs, push]);
 
@@ -436,14 +626,29 @@ export default function App() {
     if (!window.confirm(`确定删除题目「${title}」？\n将连带删除该题全部产物与运行状态，不可恢复！`)) return;
     try {
       await deleteWorkspace(id);
+      // 清掉该题的前端状态桶与运行控制器(后端 409 保护:运行中的题删不掉,不会走到这里)
+      abortMapRef.current[id]?.abort();
+      delete abortMapRef.current[id];
+      delete epochMapRef.current[id];
+      delete pausedMapRef.current[id];
+      delete streamMapRef.current[id];
+      delete streamedNodeMapRef.current[id];
+      delete announcedMapRef.current[id];
+      setWsMap((prev) => {
+        if (!(id in prev)) return prev;
+        const { [id]: _gone, ...rest } = prev;
+        return rest;
+      });
       setWorkspaces((prev) => prev.filter((w) => w.id !== id));
+      let bubbleTarget = currentWs;
       if (id === currentWs) {
         const next = workspaces.find((w) => w.id !== id);
-        await switchWs(next?.id ?? "default");
+        bubbleTarget = next?.id ?? "default";
+        await switchWs(bubbleTarget);
       }
-      push({ kind: "info", label: "题目已删除", content: title });
+      push(bubbleTarget, { kind: "info", label: "题目已删除", content: title });
     } catch (e: any) {
-      push({ kind: "error", label: "删除失败", content: String(e?.message ?? e) });
+      push(currentWsRef.current, { kind: "error", label: "删除失败", content: String(e?.message ?? e) });
     }
   }, [workspaces, currentWs, switchWs, push]);
 
@@ -454,10 +659,10 @@ export default function App() {
     try {
       const info = await uploadWorkspaceFiles(currentWs, target, files);
       setWorkspaces((prev) => prev.map((w) => (w.id === currentWs ? info : w)));
-      refreshWorkspace();
-      push({ kind: "info", label: "上传成功", content: `${files.length} 个${target === "question" ? "题目" : "数据"}文件` });
+      refreshWorkspace(currentWs);
+      push(currentWs, { kind: "info", label: "上传成功", content: `${files.length} 个${target === "question" ? "题目" : "数据"}文件` });
     } catch (err: any) {
-      push({ kind: "error", label: "上传失败", content: String(err?.message ?? err) });
+      push(currentWs, { kind: "error", label: "上传失败", content: String(err?.message ?? err) });
     } finally {
       setWsUploading(false);
       e.target.value = "";
@@ -475,9 +680,9 @@ export default function App() {
       const merged = await saveUiConfig(uiTheme);
       setUiTheme(merged);
       setShowAppearance(false);
-      push({ kind: "info", label: "外观已保存", content: "液态玻璃设置已持久化到 ui_config.json" });
+      push(currentWsRef.current, { kind: "info", label: "外观已保存", content: "液态玻璃设置已持久化到 ui_config.json" });
     } catch (e: any) {
-      push({ kind: "error", label: "保存外观失败", content: String(e?.message ?? e) });
+      push(currentWsRef.current, { kind: "error", label: "保存外观失败", content: String(e?.message ?? e) });
     }
   }, [uiTheme, push]);
 
@@ -511,9 +716,9 @@ export default function App() {
     try {
       const r = await uploadMedia(file);
       setMediaFiles(await listMedia());
-      push({ kind: "info", label: "上传成功", content: r.name });
+      push(currentWsRef.current, { kind: "info", label: "上传成功", content: r.name });
     } catch (err: any) {
-      push({ kind: "error", label: "上传失败", content: String(err?.message ?? err) });
+      push(currentWsRef.current, { kind: "error", label: "上传失败", content: String(err?.message ?? err) });
     } finally {
       setUploading(false);
       e.target.value = "";
@@ -534,17 +739,25 @@ export default function App() {
     setTheme({ bgSource: "we", weId: w.id, bgMode: w.type === "video" ? "video" : "image" });
   }, [setTheme]);
 
-  // 运行期间每 3 秒刷新一次工作区文件清单, 实时感知新生成的思路/代码/图片
+  // 运行期间每 3 秒刷新一次工作区文件清单, 实时感知新生成的思路/代码/图片(按当前查看的题)
   useEffect(() => {
     if (status !== "running") return;
-    const timer = setInterval(refreshWorkspace, 3000);
+    const timer = setInterval(() => refreshWorkspace(currentWsRef.current), 3000);
     return () => clearInterval(timer);
-  }, [status, refreshWorkspace]);
+  }, [status, currentWs, refreshWorkspace]);
 
+  // 自动滚动: 流式打字每秒触发多次, rAF 合帧 + 仅在已接近底部时跟随, 不打断用户回看
+  const scrollPendRef = useRef(false);
   useEffect(() => {
-    logBoxRef.current?.scrollTo({
-      top: logBoxRef.current.scrollHeight,
-      behavior: "smooth",
+    if (scrollPendRef.current) return;
+    scrollPendRef.current = true;
+    requestAnimationFrame(() => {
+      scrollPendRef.current = false;
+      const el = logBoxRef.current;
+      if (!el) return;
+      if (el.scrollHeight - el.scrollTop - el.clientHeight < 160) {
+        el.scrollTo({ top: el.scrollHeight });
+      }
     });
   }, [logs]);
 
@@ -590,6 +803,16 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [selected]);
 
+  // PDF 预览弹窗: ESC 关闭
+  useEffect(() => {
+    if (!viewPdf) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setViewPdf(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [viewPdf]);
+
   // 当前选中模型是否已具备可用的 key：统一以 .env（进程环境）是否就绪为准
   const currentModel = models.find((m) => m.key === selectedModel);
   const currentEnv = currentModel?.api_key_env;
@@ -604,20 +827,29 @@ export default function App() {
   );
 
   const handleEvent = useCallback(
-    (ev: SseEvent) => {
+    (id: string, ev: SseEvent) => {
       if (ev.type === "update" && ev.node) {
         const label = NODE_LABELS[ev.node] ?? ev.node;
         const isSolve = ev.node === "solve_with_method";
-        push({ kind: "node", label, method: isSolve ? ev.data?.method : undefined });
+        // 流式期间已实时宣告过该节点则不重复推节点行; solve_with_method 每方法一个
+        // 并行 Send 分支(多条同名 update), 也靠这个对比只保留一行
+        if (announcedMapRef.current[id] !== ev.node) {
+          announcedMapRef.current[id] = ev.node;
+          push(id, { kind: "node", label, method: isSolve ? ev.data?.method : undefined });
+        }
         const mapped = NODE_TO_STEP[ev.node];
-        if (mapped) setStep(mapped); // 直接赋值：SSE 事件有序，质检/审核打回时步骤可回退
+        if (mapped) patchWs(id, { step: mapped }); // 直接赋值：SSE 事件有序，质检/审核打回时步骤可回退
 
+        // 该节点正文已流式上屏 → 完整文本已在屏上, 跳过 400 字截断摘要避免重复。
+        // 并行分支下可能被先完成的同名分支消费掉, 最坏情况多一条截断摘要, 可接受
+        const hasStreamedText = streamedNodeMapRef.current[id] != null && streamedNodeMapRef.current[id] === ev.node;
+        if (hasStreamedText) streamedNodeMapRef.current[id] = null;
         const msgs: any[] = ev.data?.messages ?? [];
         for (const m of msgs.slice(0, 2).reverse()) {
           if (m.role === "tool") {
-            push({ kind: "tool", label: `工具:${m.name ?? ""}`, content: m.content || "" });
-          } else if (m.role === "ai" && m.content?.trim()) {
-            push({
+            push(id, { kind: "tool", label: `工具:${m.name ?? ""}`, content: m.content || "" });
+          } else if (m.role === "ai" && m.content?.trim() && !hasStreamedText) {
+            push(id, {
               kind: "ai",
               label: isSolve ? `${ev.data?.method ?? "未知方法"} · 模型输出` : "模型输出",
               content: m.content,
@@ -625,123 +857,131 @@ export default function App() {
           }
         }
         if (ev.data?.code_files?.length) {
-          refreshWorkspace();
+          refreshArtifactsIfVisible(id);
         }
         if (ev.data?.run_report) {
-          setRunReports(ev.data.run_report);
-          refreshWorkspace();
+          patchWs(id, { runReports: ev.data.run_report });
+          refreshArtifactsIfVisible(id);
         }
+      } else if (ev.type === "reasoning") {
+        appendStream(id, ev, "thinking");
+      } else if (ev.type === "token") {
+        appendStream(id, ev, "ai_stream");
       } else if (ev.type === "interrupt") {
+        streamMapRef.current[id] = null; streamedNodeMapRef.current[id] = null;
         const label = NODE_LABELS[ev.node ?? ""] ?? ev.node ?? "等待输入";
-        setQuestion(ev.value ?? "请输入：");
-        push({ kind: "interrupt", label, question: ev.value ?? "" });
-        setStatus("awaiting_input");
+        patchWs(id, { question: ev.value ?? "请输入：", status: "awaiting_input" });
+        push(id, { kind: "interrupt", label, question: ev.value ?? "" });
       } else if (ev.type === "suspended") {
-        setStatus("awaiting_input");
+        streamMapRef.current[id] = null; streamedNodeMapRef.current[id] = null;
+        patchWs(id, { status: "awaiting_input" });
       } else if (ev.type === "done") {
-        setStatus("done");
-        refreshWorkspace();
-        fetchState(currentWs)
+        streamMapRef.current[id] = null; streamedNodeMapRef.current[id] = null;
+        patchWs(id, { status: "done" });
+        refreshArtifactsIfVisible(id);
+        fetchState(id)
           .then((s) => {
             const sum = s.values?.final_summary || "";
-            if (sum) setFinalSummary(sum);
-            push({ kind: "info", label: "运行完成", content: "全部节点执行完毕" });
+            if (sum) patchWs(id, { finalSummary: sum });
+            push(id, { kind: "info", label: "运行完成", content: "全部节点执行完毕" });
           })
-          .catch(() => push({ kind: "error", label: "获取状态失败", content: "请检查后端" }));
+          .catch(() => push(id, { kind: "error", label: "获取状态失败", content: "请检查后端" }));
       } else if (ev.type === "log") {
         // 后端桥接的"LLM调用 → 模型[角色] · 用途"实时日志
-        push({ kind: "log", label: "模型调用", content: ev.text ?? "" });
+        push(id, { kind: "log", label: "模型调用", content: ev.text ?? "" });
       } else if (ev.type === "error") {
-        setStatus("error");
-        push({ kind: "error", label: "运行出错", content: ev.error ?? "" });
+        streamMapRef.current[id] = null; streamedNodeMapRef.current[id] = null;
+        patchWs(id, { status: "error" });
+        push(id, { kind: "error", label: "运行出错", content: ev.error ?? "" });
       }
     },
-    [push, currentWs, refreshWorkspace],
+    [push, appendStream, patchWs, refreshArtifactsIfVisible],
   );
 
   const run = useCallback(
-    async (resume: string | null, model?: string, apiKey?: string, continueRun?: boolean) => {
+    async (id: string, resume: string | null, model?: string, apiKey?: string, continueRun?: boolean) => {
       const controller = new AbortController();
-      abortRef.current = controller;
-      const myEpoch = ++epochRef.current;
-      setStatus("running");
+      abortMapRef.current[id] = controller;
+      const myEpoch = (epochMapRef.current[id] ?? 0) + 1;
+      epochMapRef.current[id] = myEpoch;
+      streamMapRef.current[id] = null; streamedNodeMapRef.current[id] = null; // 每次运行(含续跑)都从干净的流式分组开始
+      announcedMapRef.current[id] = null;
+      patchWs(id, { status: "running" });
       try {
         await startRun(
-          currentWs,
+          id,
           resume,
-          (ev) => { if (epochRef.current === myEpoch) handleEvent(ev); },
+          (ev) => { if (epochMapRef.current[id] === myEpoch) handleEvent(id, ev); },
           controller.signal,
           model,
           apiKey,
           continueRun,
         );
       } catch (e: any) {
-        if (e?.name !== "AbortError" && epochRef.current === myEpoch) {
-          setStatus("error");
-          push({ kind: "error", label: "连接失败", content: String(e?.message ?? e) });
+        if (e?.name !== "AbortError" && epochMapRef.current[id] === myEpoch) {
+          patchWs(id, { status: "error" });
+          push(id, { kind: "error", label: "连接失败", content: String(e?.message ?? e) });
         }
       } finally {
         // 仅当仍是自己的 controller 时才清空，防止旧运行的 finally 覆盖新运行的控制器
-        if (abortRef.current === controller) abortRef.current = null;
+        if (abortMapRef.current[id] === controller) abortMapRef.current[id] = null;
       }
     },
-    [currentWs, handleEvent, push],
+    [patchWs, handleEvent, push],
   );
 
   const onStart = useCallback(() => {
-    if (status === "running") return;
-    pausedRef.current = false;
-    setLogs([]);
-    setFinalSummary("");
-    setRunReports([]);
+    if (wsMapRef.current[currentWs]?.status === "running") return;
+    pausedMapRef.current[currentWs] = false;
     setSelected(null);
-    setStep(1); // 乐观置第 1 步，首个节点事件到达后按真实节点校正
-    runStartRef.current = null;
+    setElapsed(0);
+    // 乐观置第 1 步，首个节点事件到达后按真实节点校正;runStart 从本轮重计
+    patchWs(currentWs, { logs: [], finalSummary: "", runReports: [], question: null, step: 1, runStart: Date.now() });
     // 配置统一来源于 .env，环境已就绪则无需前端下发 key，后端自读；否则兜底用已保存值
     const runKey = currentModel?.key_set ? undefined : (savedKeys[currentEnv ?? ""] || undefined);
-    run(null, selectedModel, runKey);
-  }, [status, run, selectedModel, currentEnv, currentModel, savedKeys]);
+    run(currentWs, null, selectedModel, runKey);
+  }, [currentWs, run, selectedModel, currentEnv, currentModel, savedKeys, patchWs]);
 
   // 设计稿「暂停」：中断 SSE 流（后端取消图，状态停在最近 checkpoint）。
   // 「下一步」走 continue_run 从检查点续跑，不再强制重新开始
   const onPause = useCallback(() => {
-    if (status !== "running") return;
-    abortRef.current?.abort();
-    pausedRef.current = true;
-    setStatus("awaiting_input");
-    setQuestion("已暂停 · 点「下一步」从最近检查点继续");
-    push({
+    if (wsMapRef.current[currentWs]?.status !== "running") return;
+    abortMapRef.current[currentWs]?.abort();
+    pausedMapRef.current[currentWs] = true;
+    streamMapRef.current[currentWs] = null; streamedNodeMapRef.current[currentWs] = null; // 本轮流式收束, 续跑的节点重跑从新气泡开始
+    patchWs(currentWs, { status: "awaiting_input", question: "已暂停 · 点「下一步」从最近检查点继续" });
+    push(currentWs, {
       kind: "interrupt",
       label: "已暂停",
       question: "运行已中止，点「下一步」将从最近检查点继续（中断处的节点会重跑一遍）",
     });
-  }, [status, push]);
+  }, [currentWs, patchWs, push]);
 
   const onSubmitAnswer = useCallback(() => {
     if (status !== "awaiting_input") return;
     const text = answer.trim();
-    push({ kind: "user", label: "人工输入", content: text || "（回车跳过）" });
+    push(currentWs, { kind: "user", label: "人工输入", content: text || "（回车跳过）" });
     setAnswer("");
-    setQuestion(null);
+    patchWs(currentWs, { question: null });
     const runKey = currentModel?.key_set ? undefined : (savedKeys[currentEnv ?? ""] || undefined);
-    run(text, selectedModel, runKey);
-  }, [status, answer, run, push, selectedModel, currentEnv, currentModel, savedKeys]);
+    run(currentWs, text, selectedModel, runKey);
+  }, [status, answer, currentWs, run, push, patchWs, selectedModel, currentEnv, currentModel, savedKeys]);
 
   // 从最近 checkpoint 续跑（出错/暂停后）：有挂起中断则跳过当前提问，否则原地继续
   const onResume = useCallback(() => {
     if (status === "running") return;
-    pausedRef.current = false;
+    pausedMapRef.current[currentWs] = false;
     const runKey = currentModel?.key_set ? undefined : (savedKeys[currentEnv ?? ""] || undefined);
-    push({ kind: "user", label: "人工输入", content: "（从最近检查点继续运行）" });
-    run(null, selectedModel, runKey, true);
-  }, [status, run, selectedModel, currentEnv, currentModel, savedKeys, push]);
+    push(currentWs, { kind: "user", label: "人工输入", content: "（从最近检查点继续运行）" });
+    run(currentWs, null, selectedModel, runKey, true);
+  }, [status, currentWs, run, selectedModel, currentEnv, currentModel, savedKeys, push]);
 
   /* 设计稿「下一步」：待命=开始运行；暂停/出错=检查点续跑；真实 interrupt=提交输入继续 */
   const onNext = useCallback(() => {
     if (status === "idle") {
       onStart();
     } else if (status === "awaiting_input") {
-      if (pausedRef.current) {
+      if (pausedMapRef.current[currentWs]) {
         onResume();
       } else {
         onSubmitAnswer();
@@ -749,7 +989,7 @@ export default function App() {
     } else if (status === "error") {
       onResume();
     }
-  }, [status, onStart, onSubmitAnswer, onResume]);
+  }, [status, currentWs, onStart, onSubmitAnswer, onResume]);
 
   const onSaveKeys = useCallback(async () => {
     setSavingKeys(true);
@@ -765,43 +1005,102 @@ export default function App() {
       );
       setShowKeyModal(false);
       setModalKeys({});
-      push({
+      push(currentWsRef.current, {
         kind: "info",
         label: "API Key 已保存",
         content: `已持久化 ${Object.keys(keys).length} 项；下次启动默认模型：${res.model}`,
       });
     } catch (e: any) {
-      push({ kind: "error", label: "保存失败", content: String(e?.message ?? e) });
+      push(currentWsRef.current, { kind: "error", label: "保存失败", content: String(e?.message ?? e) });
     } finally {
       setSavingKeys(false);
     }
   }, [modalKeys, selectedModel, push]);
 
   const onReset = useCallback(async () => {
-    if (status === "running") {
-      abortRef.current?.abort();
+    if (wsMapRef.current[currentWs]?.status === "running") {
+      abortMapRef.current[currentWs]?.abort();
     }
-    epochRef.current++;        // 作废旧运行残余事件
-    pausedRef.current = false;
+    epochMapRef.current[currentWs] = (epochMapRef.current[currentWs] ?? 0) + 1; // 作废该题旧运行残余事件
+    pausedMapRef.current[currentWs] = false;
+    abortMapRef.current[currentWs] = null;
     await resetThread(currentWs);
-    setLogs([]);
-    setFinalSummary("");
-    setRunReports([]);
-    setQuestion(null);
+    streamMapRef.current[currentWs] = null; streamedNodeMapRef.current[currentWs] = null;
+    announcedMapRef.current[currentWs] = null;
+    patchWs(currentWs, { logs: [], finalSummary: "", runReports: [], question: null, step: 0, status: "idle", runStart: null });
     setAnswer("");
     setSelected(null);
-    setStep(0);
     setElapsed(0);
-    runStartRef.current = null;
-    setStatus("idle");
-  }, [status, currentWs]);
+  }, [currentWs, patchWs]);
+
+  // 拖拽分隔条调整左右栏宽度（左栏 160-560px / 右栏 200-620px，中栏自适应）
+  const startDrag = useCallback((side: "left" | "right", e: React.MouseEvent) => {
+    e.preventDefault();
+    splitDragRef.current = {
+      side,
+      startX: e.clientX,
+      startWidth: side === "left" ? leftWidth : rightWidth,
+    };
+    document.body.classList.add("resizing");
+    const onMove = (ev: MouseEvent) => {
+      const d = splitDragRef.current;
+      if (!d) return;
+      const dx = ev.clientX - d.startX;
+      const next =
+        d.side === "left"
+          ? Math.max(160, Math.min(560, d.startWidth + dx))
+          : Math.max(200, Math.min(620, d.startWidth - dx)); // 右栏：分隔条右移 → 右栏变窄
+      if (d.side === "left") setLeftWidth(next);
+      else setRightWidth(next);
+    };
+    const onUp = () => {
+      splitDragRef.current = null;
+      document.body.classList.remove("resizing");
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [leftWidth, rightWidth]);
 
   const openFile = useCallback(async (dir: string, name: string) => {
     setLoadingFile(true);
-    const content = await readFile(dir, name);
+    const content = await readFile(dir, name, currentWs);
     setSelected({ dir, name, content });
     setLoadingFile(false);
-  }, []);
+  }, [currentWs]);
+
+  // 手动删除产物(思路/代码/图片/PDF): 带确认;运行中的题后端会以 409 拒绝
+  const onDeleteArtifact = useCallback(async (relPath: string, label: string) => {
+    if (!window.confirm(`确定删除产物「${label}」？\n文件将被移除，不可恢复！`)) return;
+    try {
+      await deleteArtifact(relPath, currentWs);
+      // 删的是最终总结 → 同步清掉内存里的总结卡片, 不等刷新
+      if (relPath === "paper/最终总结.md") {
+        patchWs(currentWs, { finalSummary: "" });
+      }
+      refreshWorkspace(currentWs);
+      push(currentWs, { kind: "info", label: "产物已删除", content: label });
+    } catch (e: any) {
+      push(currentWs, { kind: "error", label: "删除失败", content: String(e?.message ?? e) });
+    }
+  }, [currentWs, refreshWorkspace, push, patchWs]);
+
+  // 删除题目弹窗里上传的题目/数据文件(带确认, 本地清单同步移除)
+  const onDeleteWsFile = useCallback(async (target: "question" | "dataset", name: string) => {
+    if (!window.confirm(`确定删除${target === "question" ? "题目" : "数据"}文件「${name}」？\n文件将被移除，不可恢复！`)) return;
+    try {
+      await deleteWsFile(currentWs, target, name);
+      setWorkspaces((prev) => prev.map((w) => (w.id === currentWs ? {
+        ...w,
+        questionFiles: target === "question" ? w.questionFiles.filter((x) => x !== name) : w.questionFiles,
+        datasetFiles: target === "dataset" ? w.datasetFiles.filter((x) => x !== name) : w.datasetFiles,
+      } : w)));
+      push(currentWs, { kind: "info", label: "文件已删除", content: name });
+    } catch (e: any) {
+      push(currentWs, { kind: "error", label: "删除失败", content: String(e?.message ?? e) });
+    }
+  }, [currentWs, push]);
 
   // 背景素材解析：WE 壁纸库优先（bgSource=we），否则 media 目录，默认 bg-miku.jpg 走本地资源
   const weWallpaper = uiTheme.bgSource === "we" && uiTheme.weId
@@ -886,25 +1185,53 @@ export default function App() {
   return (
     <div className="app">
       <div className="app-bg">{bgNode}</div>
-      <div className="layout">
-        {/* 左栏 · 工作流侧边栏（设计稿 220px） */}
+      <div
+      className="layout"
+      style={{ gridTemplateColumns: `${leftWidth}px 10px minmax(0, 1fr) 10px ${rightWidth}px` }}
+    >
+      {/* 左栏 · 工作流侧边栏（设计稿 220px） */}
         <aside className="panel sidebar">
           <div className="side-brand">
             <h1>MathModel Agent</h1>
             <div className="side-session">
-              <select
-                className="ws-select side-ws-select"
-                value={currentWs}
-                onChange={(e) => switchWs(e.target.value)}
-                title="切换题目：每题的题目/数据/产物/运行状态互相隔离"
-              >
-                {workspaces.map((w) => (
-                  <option key={w.id} value={w.id}>
-                    {w.title}
-                  </option>
-                ))}
-                {workspaces.length === 0 && <option value="default">默认题目</option>}
-              </select>
+              <div className="ws-dd" ref={wsDdRef}>
+                <button
+                  type="button"
+                  className="ws-select side-ws-select ws-dd-btn"
+                  onClick={() => setWsDdOpen((o) => !o)}
+                  title="切换题目（行尾 ✕ 可删题）：每题的题目/数据/产物/运行状态互相隔离"
+                >
+                  <span className="ws-dd-cur">{curWsInfo?.title ?? currentWs}</span>
+                  <span className="ws-dd-arrow">▾</span>
+                </button>
+                {wsDdOpen && (
+                  <div className="ws-dd-list">
+                    {(workspaces.length
+                      ? workspaces
+                      : [{ id: "default", title: "默认题目", createdAt: "", questionFiles: [], datasetFiles: [], hasState: false } as WorkspaceInfo]
+                    ).map((w) => (
+                      <div
+                        key={w.id}
+                        className={`ws-dd-item ${w.id === currentWs ? "active" : ""}`}
+                        onClick={() => { setWsDdOpen(false); if (w.id !== currentWs) switchWs(w.id); }}
+                        title="点击切换到该题"
+                      >
+                        <span className="ws-dd-name">
+                          {w.title}
+                          {wsMap[w.id]?.status === "running" ? "（运行中）" : ""}
+                        </span>
+                        <button
+                          className="file-del"
+                          title="删除该题目（连带全部产物与运行状态，需确认）"
+                          onClick={(e) => { e.stopPropagation(); onDeleteWs(w.id); }}
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
               <span className="side-session-id">session #{currentWs}</span>
             </div>
           </div>
@@ -979,9 +1306,21 @@ export default function App() {
                 重置
               </button>
             </div>
+            {usage && usage.calls > 0 && (
+              <div className="usage" title="本次 LLM 调用累计用量（重置/新运行时清零）">
+                <div className="usage-row">
+                  Token {fmtTokens(usage.prompt_tokens + usage.completion_tokens)}
+                  <span className="usage-sub">
+                    （入 {fmtTokens(usage.prompt_tokens)} / 出 {fmtTokens(usage.completion_tokens)}）
+                  </span>
+                </div>
+              </div>
+            )}
             <div className="elapsed">elapsed {fmtElapsed(elapsed)}</div>
           </div>
         </aside>
+
+        <div className="splitter" onMouseDown={(e) => startDrag("left", e)} title="拖拽调整栏宽" />
 
         {/* 中栏 · 对话流（设计稿自适应宽度） */}
         <section className="panel chat-panel">
@@ -1013,7 +1352,7 @@ export default function App() {
                 <span>运行过程将以对话气泡形式实时展示</span>
               </div>
             )}
-            {logs.map((item) => {
+            {logs.map((item, idx) => {
               if (item.kind === "user") {
                 return (
                   <div key={item.id} className="msg user">
@@ -1021,7 +1360,29 @@ export default function App() {
                   </div>
                 );
               }
-              if (item.kind === "ai") {
+              if (item.kind === "thinking") {
+                // 思考过程: 流式打字中(details 常开+内滚跟随), 结束后默认折叠可回看
+                const live = status === "running" && idx === logs.length - 1;
+                return (
+                  <div key={item.id} className="msg agent">
+                    <div className="avatar">❖</div>
+                    <div className="msg-body">
+                      <div className="msg-meta">{item.label}{live ? " · 思考中" : ""}</div>
+                      <details className="bubble think" open={live || undefined}>
+                        <summary>💭 思考过程</summary>
+                        <div
+                          className="think-text"
+                          ref={(el) => { if (el && live) el.scrollTop = el.scrollHeight; }}
+                        >
+                          {item.content || "…"}
+                        </div>
+                      </details>
+                    </div>
+                  </div>
+                );
+              }
+              if (item.kind === "ai_stream" || item.kind === "ai") {
+                const live = item.kind === "ai_stream" && status === "running" && idx === logs.length - 1;
                 return (
                   <div key={item.id} className="msg agent">
                     <div className="avatar">❖</div>
@@ -1029,6 +1390,7 @@ export default function App() {
                       <div className="msg-meta">MathModel Agent · now</div>
                       <div className="bubble md">
                         <FoldingMarkdown source={item.content} />
+                        {live && <span className="stream-caret" />}
                       </div>
                     </div>
                   </div>
@@ -1121,6 +1483,8 @@ export default function App() {
         </section>
 
 
+        <div className="splitter" onMouseDown={(e) => startDrag("right", e)} title="拖拽调整栏宽" />
+
         {/* 右栏 · 中间产物（设计稿 280px） */}
         <aside className="panel artifacts">
           <div className="art-head">
@@ -1128,7 +1492,13 @@ export default function App() {
             <span className="art-count">{papers.length + codes.length + images.length} items</span>
           </div>
           <div className="art-scroll">
-            <div className="art-card">
+            <div
+              className={`art-card ${finalSummary ? "clickable" : ""}`}
+              onClick={() => {
+                if (finalSummary) setSelected({ dir: "paper", name: "最终总结.md", content: finalSummary });
+              }}
+              title={finalSummary ? "点击放大查看" : undefined}
+            >
               <div className="art-card-title">最终总结</div>
               <div className="art-summary">
                 {finalSummary ? (
@@ -1144,14 +1514,22 @@ export default function App() {
               <div className="art-files">
                 {papers.length === 0 && <span className="art-none">（暂无）</span>}
                 {papers.map((f) => (
-                  <button
-                    key={f.name}
-                    className={`ws-item ${selected?.name === f.name && selected.dir === "paper" ? "active" : ""}`}
-                    onClick={() => openFile("paper", f.name)}
-                    title={`${f.name} · 点击预览`}
-                  >
-                    {f.name}
-                  </button>
+                  <div key={f.name} className="ws-item-row">
+                    <button
+                      className={`ws-item ${selected?.name === f.name && selected.dir === "paper" ? "active" : ""}`}
+                      onClick={() => openFile("paper", f.name)}
+                      title={`${f.name} · 点击预览`}
+                    >
+                      {f.name}
+                    </button>
+                    <button
+                      className="file-del"
+                      title="删除该文件"
+                      onClick={(e) => { e.stopPropagation(); onDeleteArtifact(`paper/${f.name}`, f.name); }}
+                    >
+                      ✕
+                    </button>
+                  </div>
                 ))}
               </div>
             </div>
@@ -1161,14 +1539,22 @@ export default function App() {
               <div className="art-files">
                 {codes.length === 0 && <span className="art-none">（暂无）</span>}
                 {codes.map((f) => (
-                  <button
-                    key={f.name}
-                    className={`ws-item ${selected?.name === f.name && selected.dir === "code" ? "active" : ""}`}
-                    onClick={() => openFile("code", f.name)}
-                    title={`${f.name} · 点击预览`}
-                  >
-                    {f.name}
-                  </button>
+                  <div key={f.name} className="ws-item-row">
+                    <button
+                      className={`ws-item ${selected?.name === f.name && selected.dir === "code" ? "active" : ""}`}
+                      onClick={() => openFile("code", f.name)}
+                      title={`${f.name} · 点击预览`}
+                    >
+                      {f.name}
+                    </button>
+                    <button
+                      className="file-del"
+                      title="删除该文件"
+                      onClick={(e) => { e.stopPropagation(); onDeleteArtifact(`code/${f.name}`, f.name); }}
+                    >
+                      ✕
+                    </button>
+                  </div>
                 ))}
               </div>
             </div>
@@ -1178,17 +1564,52 @@ export default function App() {
               {images.length === 0 && <div className="art-none">（暂无）运行到求解阶段后自动生成</div>}
               <div className="thumb-grid">
                 {images.map((f) => (
-                  <button
-                    key={f.name}
-                    className="thumb"
-                    title={`${f.name} · 点击放大`}
-                    onClick={() => setZoomImage(f.name)}
-                  >
-                    <img src={imageUrl("photo", f.name)} alt={f.name} loading="lazy" />
-                  </button>
+                  <div key={f.name} className="thumb-wrap">
+                    <button
+                      className="thumb"
+                      title={`${f.name} · 点击放大`}
+                      onClick={() => setZoomImage(f.name)}
+                    >
+                      <img src={imageUrl("photo", f.name, currentWs)} alt={f.name} loading="lazy" />
+                    </button>
+                    <button
+                      className="file-del"
+                      title="删除该图片"
+                      onClick={(e) => { e.stopPropagation(); onDeleteArtifact(`photo/${f.name}`, f.name); }}
+                    >
+                      ✕
+                    </button>
+                  </div>
                 ))}
               </div>
             </div>
+
+            {pdfs.length > 0 && (
+              <div className="art-card">
+                <div className="art-card-title">PDF 文档</div>
+                <div className="art-files">
+                  {pdfs.map((f) => (
+                    <div key={f.path} className="ws-item-row">
+                      <button
+                        className="ws-item"
+                        onClick={() => setViewPdf(f)}
+                        title={`${f.name} · 点击预览`}
+                      >
+                        {f.name}
+                        <span className="pdf-size"> {fmtSize(f.size)}</span>
+                      </button>
+                      <button
+                        className="file-del"
+                        title="删除该 PDF"
+                        onClick={(e) => { e.stopPropagation(); onDeleteArtifact(f.path, f.name); }}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             <div className="art-card">
               <div className="art-card-title">运行报告</div>
@@ -1242,7 +1663,7 @@ export default function App() {
             ×
           </button>
           <img
-            src={imageUrl("photo", zoomImage)}
+            src={imageUrl("photo", zoomImage, currentWs)}
             alt={zoomImage}
             style={{ transform: `scale(${zoomScale})` }}
             onClick={(e) => e.stopPropagation()}
@@ -1354,6 +1775,31 @@ export default function App() {
                 ))}
                 <label className="appearance-swatch appearance-swatch--custom" title="自定义玻璃色">
                   <input type="color" value={uiTheme.glassColor} onChange={(e) => setTheme({ glassColor: e.target.value })} />
+                </label>
+              </div>
+            </div>
+
+            <div className="appearance-row">
+              <span className="appearance-label">文字颜色</span>
+              <div className="appearance-swatches">
+                <button
+                  className={`appearance-swatch appearance-swatch--textdefault ${uiTheme.textColor === "" ? "appearance-swatch--active" : ""}`}
+                  onClick={() => setTheme({ textColor: "" })}
+                  title="默认（跟随主题）"
+                >
+                  默认
+                </button>
+                {TEXT_COLOR_PRESETS.map((hex) => (
+                  <button
+                    key={hex}
+                    className={`appearance-swatch ${uiTheme.textColor === hex ? "appearance-swatch--active" : ""}`}
+                    style={{ background: hex }}
+                    onClick={() => setTheme({ textColor: hex })}
+                    title={hex}
+                  />
+                ))}
+                <label className="appearance-swatch appearance-swatch--custom" title="自定义文字颜色">
+                  <input type="color" value={uiTheme.textColor || "#16233c"} onChange={(e) => setTheme({ textColor: e.target.value })} />
                 </label>
               </div>
             </div>
@@ -1662,7 +2108,10 @@ export default function App() {
               <div className="appearance-media-list" style={{ maxHeight: 90 }}>
                 {(curWsInfo?.questionFiles.length ?? 0) === 0 && <span style={{ color: "var(--muted)", fontSize: 12 }}>（无，请上传）</span>}
                 {curWsInfo?.questionFiles.map((f) => (
-                  <span key={f} className="appearance-media-item" style={{ cursor: "default" }}>{f}</span>
+                  <span key={f} className="appearance-media-item" style={{ cursor: "default" }}>
+                    {f}
+                    <button className="file-del" title="删除该文件" onClick={() => onDeleteWsFile("question", f)}>✕</button>
+                  </span>
                 ))}
               </div>
             </div>
@@ -1672,7 +2121,10 @@ export default function App() {
               <div className="appearance-media-list" style={{ maxHeight: 90 }}>
                 {(curWsInfo?.datasetFiles.length ?? 0) === 0 && <span style={{ color: "var(--muted)", fontSize: 12 }}>（无，请上传）</span>}
                 {curWsInfo?.datasetFiles.map((f) => (
-                  <span key={f} className="appearance-media-item" style={{ cursor: "default" }}>{f}</span>
+                  <span key={f} className="appearance-media-item" style={{ cursor: "default" }}>
+                    {f}
+                    <button className="file-del" title="删除该文件" onClick={() => onDeleteWsFile("dataset", f)}>✕</button>
+                  </span>
                 ))}
               </div>
             </div>
@@ -1687,10 +2139,41 @@ export default function App() {
         </div>
       )}
 
+      {/* PDF 预览弹窗（内嵌渲染论文/合规文档，Esc 关闭） */}
+      {viewPdf && (
+        <div className="modal-mask" onClick={() => setViewPdf(null)}>
+          <div
+            className="modal pdf-modal"
+            style={docSize ? { width: docSize.w, height: docSize.h } : undefined}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-head">
+              <h3>{viewPdf.name}</h3>
+              <div className="modal-head-actions">
+                <button
+                  className="btn ghost sm"
+                  onClick={() => window.open(pdfUrl(viewPdf.path, currentWs), "_blank")}
+                  title="在系统浏览器中打开（内嵌预览异常时的备选）"
+                >
+                  浏览器打开
+                </button>
+                <button className="modal-close" onClick={() => setViewPdf(null)} title="关闭 (Esc)">×</button>
+              </div>
+            </div>
+            <iframe src={pdfUrl(viewPdf.path, currentWs)} title={viewPdf.name} className="pdf-frame" />
+            <div className="modal-resize" onMouseDown={startDocResize} title="拖拽调整大小" />
+          </div>
+        </div>
+      )}
+
       {/* 文件预览弹窗（替代原内联预览区） */}
       {selected && (
         <div className="modal-mask" onClick={() => setSelected(null)}>
-          <div className="modal file-modal" onClick={(e) => e.stopPropagation()}>
+          <div
+            className="modal file-modal"
+            style={docSize ? { width: docSize.w, height: docSize.h } : undefined}
+            onClick={(e) => e.stopPropagation()}
+          >
             <div className="modal-head">
               <h3>{selected.dir}/{selected.name}</h3>
               <button className="modal-close" onClick={() => setSelected(null)} title="关闭 (Esc)">×</button>
@@ -1706,6 +2189,7 @@ export default function App() {
                 </div>
               )}
             </div>
+            <div className="modal-resize" onMouseDown={startDocResize} title="拖拽调整大小" />
           </div>
         </div>
       )}

@@ -397,15 +397,50 @@ body {
   border-color: rgba(224, 36, 56, 0.5);
 }
 
-/* ---------- 三栏布局（设计稿：220px 侧边栏 / 自适应对话流 / 280px 产物栏） ---------- */
+/* ---------- 三栏布局（设计稿：220px 侧边栏 / 自适应对话流 / 280px 产物栏）
+   列宽由 JS 内联 gridTemplateColumns 驱动，分隔条（splitter）拖拽实时调整 ---------- */
 .layout {
   flex: 1;
   display: grid;
-  grid-template-columns: 232px minmax(0, 1fr) 312px;
-  gap: 10px;
+  grid-template-columns: 232px minmax(0, 1fr) 312px; /* JS 覆盖：左 + 分隔条 + 中 + 分隔条 + 右 */
+  gap: 0;
   padding: 10px;
   min-height: 0;
   overflow: hidden;
+}
+
+/* 可拖拽分隔条（左右两处）：10px 宽占位列，hover/拖拽时显示强调色指示条 */
+.splitter {
+  position: relative;
+  cursor: col-resize;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+.splitter::before {
+  content: "";
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  left: 50%;
+  width: 4px;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  background: transparent;
+  transition: background 0.2s ease;
+}
+
+.splitter:hover::before,
+body.resizing .splitter::before {
+  background: color-mix(in srgb, var(--we-accent) 45%, transparent);
+}
+
+/* 拖拽期间全局禁止选中文本、显示调整光标（避免拖动过程选中面板文字） */
+body.resizing {
+  cursor: col-resize;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 /* ---------- 侧边栏结构 ---------- */
@@ -548,6 +583,56 @@ body {
   font-size: 11.5px;
   font-family: "Cascadia Code", Consolas, monospace;
   letter-spacing: 0.5px;
+}
+
+/* Token 消耗 / 缓存命中（侧边栏底部，/api/usage 3s 轮询；命中率仅 DeepSeek/OpenAI 可用，否则显示 —） */
+.usage {
+  text-align: center;
+  color: var(--text);
+  font-size: 11.5px;
+  line-height: 1.6;
+  font-family: "Cascadia Code", Consolas, monospace;
+  letter-spacing: 0.3px;
+}
+
+.usage-row {
+  display: flex;
+  justify-content: center;
+  align-items: baseline;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.usage-sub {
+  opacity: 0.82;
+}
+
+/* PDF 预览弹窗（内嵌论文/合规文档渲染） */
+.pdf-modal {
+  width: min(1080px, 94vw);
+  height: 90vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.pdf-frame {
+  flex: 1;
+  width: 100%;
+  border: none;
+  background: #fff;
+  border-radius: 0 0 12px 12px;
+}
+
+.modal-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.pdf-size {
+  opacity: 0.7;
+  font-size: 11px;
 }
 
 .panel {
@@ -1200,6 +1285,16 @@ body {
   margin-bottom: 7px;
 }
 
+/* 「最终总结」卡片: 有内容时整体可点击 → 打开大弹窗查看(与文件列表同一交互) */
+.art-card.clickable {
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+
+.art-card.clickable:hover {
+  border-color: color-mix(in srgb, var(--we-accent) 45%, var(--glass-border));
+}
+
 .art-files {
   display: flex;
   flex-direction: column;
@@ -1301,10 +1396,51 @@ body {
 
 /* 文件预览弹窗 */
 .file-modal {
-  width: 760px;
-  height: 82vh;
+  width: min(1100px, 88vw);
+  height: 88vh;
   display: flex;
   flex-direction: column;
+}
+
+/* 两个文档弹窗: 定位锚点给右下角缩放手柄; 放开 .modal 的 86vh/92vw 钳制允许拖到接近全屏;
+   overflow 收敛到 body/iframe 内部, 避免双滚动条并让圆角正确裁剪。
+   注意用 .modal.xxx 提升特异性——本块若写在 .modal 规则之前, 同特异性会被其 92vw/86vh 反压 */
+.modal.file-modal,
+.modal.pdf-modal {
+  position: relative;
+  max-width: 96vw;
+  max-height: 96vh;
+  overflow: hidden;
+}
+
+body.doc-resizing {
+  cursor: nwse-resize;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.modal-resize {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 18px;
+  height: 18px;
+  cursor: nwse-resize;
+  z-index: 5;
+  border-radius: 0 0 14px 0;
+  opacity: 0.65;
+  background: linear-gradient(
+    135deg,
+    transparent 0 44%,
+    color-mix(in srgb, var(--we-accent) 60%, transparent) 44% 54%,
+    transparent 54% 68%,
+    color-mix(in srgb, var(--we-accent) 60%, transparent) 68% 78%,
+    transparent 78%
+  );
+}
+
+.modal-resize:hover {
+  opacity: 1;
 }
 
 .file-modal-body {
@@ -1614,6 +1750,103 @@ body {
   overflow: hidden;
 }
 
+/* 「默认」文字药丸: 回落到主题原色用 */
+.appearance-swatch--textdefault {
+  width: auto;
+  border-radius: 13px;
+  padding: 0 10px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--we-glass-color) 60%, transparent);
+  display: inline-flex;
+  align-items: center;
+}
+
+/* ============================================================
+   顶栏题目下拉(自绘): 点击切换, 行尾 ✕ 删题
+   ============================================================ */
+.ws-dd {
+  position: relative;
+}
+
+.ws-dd-btn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  text-align: left;
+}
+
+.ws-dd-cur {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-dd-arrow {
+  flex-shrink: 0;
+  opacity: 0.7;
+  font-size: 10px;
+}
+
+.ws-dd-list {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  background-color: var(--glass-strong);
+  background-image: var(--glass-sheen);
+  backdrop-filter: var(--glass-recipe);
+  -webkit-backdrop-filter: var(--glass-recipe);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(15, 40, 105, 0.22);
+  padding: 4px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.ws-dd-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  border-radius: 7px;
+  cursor: pointer;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.ws-dd-item:hover {
+  background: color-mix(in srgb, var(--we-accent) 12%, transparent);
+}
+
+.ws-dd-item.active {
+  background: var(--grad);
+  color: #fff;
+}
+
+.ws-dd-item.active .file-del {
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.ws-dd-item.active .file-del:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.ws-dd-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .appearance-swatch--custom input[type="color"] {
   position: absolute;
   inset: -6px;
@@ -1846,4 +2079,105 @@ body {
   .modal-mask {
     background: rgba(15, 23, 42, 0.62);
   }
+}
+
+/* ============================================================
+   流式输出: 思考过程气泡 / 打字光标
+   ============================================================ */
+.bubble.think {
+  padding: 8px 12px;
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--we-accent) 30%, var(--glass-border));
+  background: color-mix(in srgb, var(--we-accent) 4%, var(--glass-input));
+  font-size: 12.5px;
+}
+
+.bubble.think summary {
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  color: var(--muted);
+  letter-spacing: 0.5px;
+}
+
+.bubble.think .think-text {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--glass-border);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.65;
+  color: var(--muted);
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.stream-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 3px;
+  vertical-align: -0.15em;
+  background: currentColor;
+  animation: caret-blink 0.9s steps(2, start) infinite;
+}
+
+@keyframes caret-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* ============================================================
+   产物/题目文件行内删除按钮
+   ============================================================ */
+.ws-item-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.ws-item-row .ws-item {
+  flex: 1;
+  min-width: 0;
+}
+
+.file-del {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.file-del:hover {
+  color: var(--bad);
+  background: rgba(224, 36, 56, 0.12);
+}
+
+.thumb-wrap {
+  position: relative;
+}
+
+.thumb-wrap .file-del {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  font-size: 11px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.45);
+  border-radius: 50%;
+}
+
+.appearance-media-item .file-del {
+  margin-left: 4px;
+  font-size: 11px;
 }

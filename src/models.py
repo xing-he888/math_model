@@ -3,7 +3,8 @@
 模型注册表 + 工厂：让 agent 支持在多个大模型之间切换。
 
 所有模型都走 OpenAI 兼容接口（/v1/chat/completions），
-因此用同一个 ChatOpenAI 客户端即可对接各家；DeepSeek 因有 thinking 参数，单独用 ChatDeepSeek；
+因此用同一个 ChatOpenAI 客户端即可对接各家（子类 _ThinkCaptureChatOpenAI 额外捕获
+reasoning_content 思考链，行为与父类一致）；DeepSeek 因有 thinking 参数，单独用 ChatDeepSeek；
 OpenRouter 是聚合网关，按官方推荐用专用包 langchain-openrouter 的 ChatOpenRouter。
 新增模型：在 MODEL_REGISTRY 里加一项即可，无需改动 agent.py。
 
@@ -18,6 +19,47 @@ try:
     from langchain_openai import ChatOpenAI
 except Exception:  # 未安装时仅 deepseek 可用
     ChatOpenAI = None
+
+if ChatOpenAI is not None:
+
+    class _ThinkCaptureChatOpenAI(ChatOpenAI):
+        """带思考链捕获的 ChatOpenAI:GLM/Qwen/Kimi 等 OpenAI 兼容推理模型把思考过程
+        放在流式 delta 的 reasoning_content 字段(社区事实标准),langchain-openai 官方
+        不提取该字段。这里沿用 langchain-deepseek 同款扩展钩子,只加不改:字段转换、
+        请求构造全部走父类,仅把思考增量附加进 additional_kwargs,供后端 SSE 实时转发。
+        """
+
+        def _convert_chunk_to_generation_chunk(
+            self, chunk: dict, default_chunk_class: type, base_generation_info: dict | None
+        ):
+            generation_chunk = super()._convert_chunk_to_generation_chunk(
+                chunk, default_chunk_class, base_generation_info
+            )
+            if generation_chunk is None:
+                return None
+            choices = chunk.get("choices") if isinstance(chunk, dict) else None
+            delta = (choices[0].get("delta") if choices else None) or {}
+            reasoning = delta.get("reasoning_content")
+            if reasoning is None:
+                reasoning = delta.get("reasoning")  # OpenRouter 风格字段
+            if reasoning is not None:
+                generation_chunk.message.additional_kwargs["reasoning_content"] = reasoning
+            return generation_chunk
+
+        def _create_chat_result(self, response, generation_info=None):
+            rtn = super()._create_chat_result(response, generation_info)
+            choices = getattr(response, "choices", None)
+            if choices:
+                msg = choices[0].message
+                rc = getattr(msg, "reasoning_content", None)
+                if rc is None and isinstance(getattr(msg, "model_extra", None), dict):
+                    rc = msg.model_extra.get("reasoning")
+                if rc:
+                    rtn.generations[0].message.additional_kwargs["reasoning_content"] = rc
+            return rtn
+
+else:
+    _ThinkCaptureChatOpenAI = None
 
 try:
     from langchain_openrouter import ChatOpenRouter
@@ -159,12 +201,12 @@ def get_model(name: str = None, role: str = "text"):
     if extra is not None:
         kwargs["extra_body"] = extra
     try:
-        instance = ChatOpenAI(**kwargs)
+        instance = _ThinkCaptureChatOpenAI(**kwargs)
     except (TypeError, ValueError):
         # 旧版 langchain-openai 不支持 extra_body（pydantic 抛 ValidationError=ValueError 子类）：
         # 退回不传思考参数，等效于各模型默认行为
         kwargs.pop("extra_body", None)
-        instance = ChatOpenAI(**kwargs)
+        instance = _ThinkCaptureChatOpenAI(**kwargs)
     _MODEL_CACHE[cache_key] = instance
     return instance
 

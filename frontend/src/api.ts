@@ -1,10 +1,12 @@
 export interface SseEvent {
-  type: "update" | "interrupt" | "suspended" | "done" | "error" | "log";
+  type: "update" | "interrupt" | "suspended" | "done" | "error" | "log" | "token" | "reasoning";
   node?: string;
   data?: any;
   value?: string;
   error?: string;
   text?: string;
+  /** 流式增量所属的 LLM 消息 id（token/reasoning 事件）：同 id 归入同一条打字气泡 */
+  mid?: string;
 }
 
 declare global {
@@ -168,14 +170,37 @@ export async function checkHealth(): Promise<boolean> {
   }
 }
 
+// ---------- Token 消耗 / 缓存命中统计 ----------
+export interface UsageStats {
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cache_hit_tokens: number;
+  cache_miss_tokens: number;
+  /** 本次累计中是否出现过缓存字段（仅 DeepSeek/OpenAI 接口返回）——false 时前端命中率显示 — */
+  cache_supported: boolean;
+  by_role: Record<string, { calls: number; prompt_tokens: number; completion_tokens: number }>;
+}
+
+/** 拉取 token/缓存命中统计（全局累计，/api/reset 与新运行清零）；后端旧版本无该接口时返回 null */
+export async function fetchUsage(): Promise<UsageStats | null> {
+  try {
+    const resp = await fetch(`${backendUrl()}/api/usage`, { signal: AbortSignal.timeout(3000) });
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch {
+    return null;
+  }
+}
+
 export interface WorkspaceFile {
   name: string;
   size: number;
 }
 
-export async function listFiles(workDir: string): Promise<WorkspaceFile[]> {
+export async function listFiles(workDir: string, threadId?: string): Promise<WorkspaceFile[]> {
   const resp = await fetch(
-    `${backendUrl()}/api/files?work_dir=${encodeURIComponent(workDir)}`,
+    `${backendUrl()}/api/files?work_dir=${encodeURIComponent(workDir)}${threadId ? `&thread_id=${encodeURIComponent(threadId)}` : ""}`,
     { signal: AbortSignal.timeout(5000) },
   );
   if (!resp.ok) return [];
@@ -183,9 +208,9 @@ export async function listFiles(workDir: string): Promise<WorkspaceFile[]> {
   return data.files ?? [];
 }
 
-export async function readFile(workDir: string, relPath: string): Promise<string> {
+export async function readFile(workDir: string, relPath: string, threadId?: string): Promise<string> {
   const resp = await fetch(
-    `${backendUrl()}/api/file?work_dir=${encodeURIComponent(workDir)}&rel_path=${encodeURIComponent(relPath)}`,
+    `${backendUrl()}/api/file?work_dir=${encodeURIComponent(workDir)}&rel_path=${encodeURIComponent(relPath)}${threadId ? `&thread_id=${encodeURIComponent(threadId)}` : ""}`,
     { signal: AbortSignal.timeout(10000) },
   );
   if (!resp.ok) return "";
@@ -193,14 +218,59 @@ export async function readFile(workDir: string, relPath: string): Promise<string
   return data.content ?? "";
 }
 
-export const imageUrl = (workDir: string, relPath: string) =>
-  `${backendUrl()}/api/image?work_dir=${encodeURIComponent(workDir)}&rel_path=${encodeURIComponent(relPath)}`;
+export const imageUrl = (workDir: string, relPath: string, threadId?: string) =>
+  `${backendUrl()}/api/image?work_dir=${encodeURIComponent(workDir)}&rel_path=${encodeURIComponent(relPath)}${threadId ? `&thread_id=${encodeURIComponent(threadId)}` : ""}`;
+
+/** 删除工作区内单个产物文件(rel_path 相对工作区根, 如 "paper/xxx_思路.md"、"photo/x.png") */
+export async function deleteArtifact(relPath: string, threadId?: string): Promise<void> {
+  const resp = await fetch(
+    `${backendUrl()}/api/file?rel_path=${encodeURIComponent(relPath)}${threadId ? `&thread_id=${encodeURIComponent(threadId)}` : ""}`,
+    { method: "DELETE" },
+  );
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`删除失败: ${resp.status} ${text.slice(0, 120)}`);
+  }
+}
+
+/** 删除题目上传的题目/数据文件(target=question|dataset) */
+export async function deleteWsFile(wsId: string, target: "question" | "dataset", name: string): Promise<void> {
+  const resp = await fetch(
+    `${backendUrl()}/api/workspaces/${encodeURIComponent(wsId)}/file?target=${target}&name=${encodeURIComponent(name)}`,
+    { method: "DELETE" },
+  );
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`删除失败: ${resp.status} ${text.slice(0, 120)}`);
+  }
+}
+
+// ---------- PDF 产物预览 ----------
+export interface PdfInfo {
+  name: string;
+  path: string;
+  size: number;
+}
+
+export async function listPdfs(threadId?: string): Promise<PdfInfo[]> {
+  try {
+    const resp = await fetch(`${backendUrl()}/api/pdfs${threadId ? `?thread_id=${encodeURIComponent(threadId)}` : ""}`, { signal: AbortSignal.timeout(4000) });
+    if (!resp.ok) return [];
+    return (await resp.json()).pdfs ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export const pdfUrl = (path: string, threadId?: string) =>
+  `${backendUrl()}/api/pdf?path=${encodeURIComponent(path)}${threadId ? `&thread_id=${encodeURIComponent(threadId)}` : ""}`;
 
 export const mediaUrl = (name: string) =>
   `${backendUrl()}/api/media/file?name=${encodeURIComponent(name)}`;
 
 export interface UiConfig {
   accent: string;
+  textColor: string;      // 文字主色(""=跟随主题默认)
   glassAlpha: number;     // 0-60，越大越透
   glassColor: string;
   blur: number;           // 玻璃模糊 px
@@ -230,6 +300,7 @@ export interface UiConfig {
 
 export const DEFAULT_UI: UiConfig = {
   accent: "#4f8cff",
+  textColor: "",
   glassAlpha: 12,
   glassColor: "#ffffff",
   blur: 16,

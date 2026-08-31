@@ -12,6 +12,7 @@ import os
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from langchain_core.messages import HumanMessage,AIMessage, SystemMessage, ToolMessage, RemoveMessage
+from langchain_core.callbacks import BaseCallbackHandler
 from dotenv import  load_dotenv
 from langgraph.prebuilt import ToolNode
 from langchain_core.tools import tool
@@ -31,6 +32,7 @@ import pandas as pd
 import json
 import re
 import time
+import threading
 import operator
 import subprocess
 import shutil
@@ -63,7 +65,7 @@ def _llm_role(m) -> str:
     注意 with_structured_output/bind_tools 都会生成新包装对象,须逐一身份比对。"""
     if m is model_text or m is model_think_tool:
         return "text"
-    if m is struct_model or m is model_with_struct or m is model_feedback_struct:
+    if m is struct_model or m is model_with_struct or m is model_feedback_struct or m is model_plan_struct:
         return "struct"
     return "tool"
 
@@ -71,6 +73,130 @@ def _log_llm(m, action: str = "") -> None:
     role = _llm_role(m)
     suffix = f" · {action}" if action else ""
     logger.info(f"LLM调用 → {MODEL_NAMES.get(role, '?')}[{role}]{suffix}")
+
+# ---------- Token 消耗 / 缓存命中统计(后端 GET /api/usage 读取, 前端侧边栏展示) ----------
+# 全局单桶:与"手动单题运行"用法一致, /api/reset 与每次新运行时由后端清零。
+# 节点由 langgraph 放线程池并行执行, 累加必须持锁; 统计环节任何异常都吞掉, 绝不影响主流程。
+_usage_lock = threading.Lock()
+usage_stats = {
+    "calls": 0,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "cache_hit_tokens": 0,    # DeepSeek: prompt_cache_hit_tokens; OpenAI: prompt_tokens_details.cached_tokens
+    "cache_miss_tokens": 0,   # DeepSeek 专有
+    "cache_supported": False, # 本次累计中是否出现过缓存字段(决定前端显示命中率还是"—")
+    "by_role": {},            # 角色(tool/text/struct)分桶: {calls, prompt_tokens, completion_tokens}
+}
+
+def _record_usage(msg, role: str) -> None:
+    """从底层 AIMessage 的 token_usage 累计一笔。缓存命中字段按优先级探测:
+    DeepSeek(prompt_cache_hit_tokens) → OpenAI(prompt_tokens_details.cached_tokens);
+    都没有的模型命中数保持 0 且不置 cache_supported, 前端显示"—", 厂商未来上报后自动点亮。"""
+    try:
+        usage = (getattr(msg, "response_metadata", None) or {}).get("token_usage") or {}
+        um = getattr(msg, "usage_metadata", None) or {}
+        prompt = int(usage.get("prompt_tokens") or um.get("input_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or um.get("output_tokens") or 0)
+        if "prompt_cache_hit_tokens" in usage:                 # DeepSeek
+            supported, hit = True, int(usage.get("prompt_cache_hit_tokens") or 0)
+            miss = int(usage.get("prompt_cache_miss_tokens") or 0)
+        elif isinstance(usage.get("prompt_tokens_details"), dict):  # OpenAI 系
+            supported, hit = True, int(usage["prompt_tokens_details"].get("cached_tokens") or 0)
+            miss = 0
+        else:
+            supported, hit, miss = False, 0, 0
+        if prompt <= 0 and completion <= 0:
+            return
+        with _usage_lock:
+            s = usage_stats
+            s["calls"] += 1
+            s["prompt_tokens"] += prompt
+            s["completion_tokens"] += completion
+            s["cache_hit_tokens"] += hit
+            s["cache_miss_tokens"] += miss
+            s["cache_supported"] = s["cache_supported"] or supported
+            r = s["by_role"].setdefault(role, {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0})
+            r["calls"] += 1
+            r["prompt_tokens"] += prompt
+            r["completion_tokens"] += completion
+    except Exception:
+        pass
+
+class _UsageCollector(BaseCallbackHandler):
+    """单次 invoke 的用量采集回调: 在 on_llm_end 抓底层 AIMessage 记账。
+    with_structured_output 的返回值是解析后的 dict(元数据被吃掉), 必须经回调拿原始消息;
+    普通调用统一也走这里, 保证全项目记账口径只有一条。"""
+    def __init__(self) -> None:
+        super().__init__()
+        self.msgs = []
+
+    def on_llm_end(self, response, **kwargs) -> None:
+        try:
+            for gens in (getattr(response, "generations", None) or []):
+                for g in (gens or []):
+                    m = getattr(g, "message", None)
+                    if m is not None:
+                        self.msgs.append(m)
+        except Exception:
+            pass
+
+    def drain(self, role: str) -> None:
+        for m in self.msgs:
+            _record_usage(m, role)
+        self.msgs = []
+
+def usage_snapshot() -> dict:
+    """返回统计副本(嵌套 by_role 一并复制), 供后端接口安全序列化"""
+    with _usage_lock:
+        return {**usage_stats, "by_role": {k: dict(v) for k, v in usage_stats["by_role"].items()}}
+
+def reset_usage() -> None:
+    """清零统计: 后端 /api/reset 与每次新运行时调用"""
+    with _usage_lock:
+        usage_stats.update({
+            "calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+            "cache_hit_tokens": 0, "cache_miss_tokens": 0, "cache_supported": False,
+        })
+        usage_stats["by_role"] = {}
+
+# ---------- AI 使用事件日志(2026 国赛 AI 使用规定: 声明与《AI 工具使用详情》的事实来源) ----------
+# 与 usage_stats 同款模式: 模块级+锁, 新运行时随 reset_usage 一并清零; 记录失败不影响主流程。
+_ai_log_lock = threading.Lock()
+ai_usage_events: List[Dict[str, str]] = []   # {time, kind, model, summary, detail}
+
+def log_ai_event(kind: str, summary: str, model: str = "", detail: str = "") -> None:
+    """记录一条 AI 使用/人工审查事件。kind: '调用' | '人工审查'; 超过 500 条后丢弃(防撑爆内存)。"""
+    try:
+        entry = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "kind": kind,
+            "model": model or "",
+            "summary": (summary or "")[:120],
+            "detail": (detail or "")[:400],
+        }
+        with _ai_log_lock:
+            if len(ai_usage_events) < 500:
+                ai_usage_events.append(entry)
+    except Exception:
+        pass
+
+def ai_events_snapshot() -> List[Dict[str, str]]:
+    with _ai_log_lock:
+        return [dict(e) for e in ai_usage_events]
+
+def reset_ai_log() -> None:
+    with _ai_log_lock:
+        ai_usage_events.clear()
+
+def _first_human_excerpt(msgs) -> str:
+    """取第一条用户消息做摘录(AI 详情 PDF 里'典型提示摘录'的素材)。"""
+    try:
+        for m in (msgs or []):
+            if getattr(m, "type", "") == "human":
+                return re.sub(r"\s+", " ", str(getattr(m, "content", "")))[:400]
+    except Exception:
+        pass
+    return ""
 
 def _invoke_llm(model_obj, msgs, action: str = "", retries: int = 2):
     """模型调用带降级 + 重试：
@@ -87,7 +213,12 @@ def _invoke_llm(model_obj, msgs, action: str = "", retries: int = 2):
     _log_llm(model_obj, action)
     for attempt in range(retries + 1):
         try:
-            return model_obj.invoke(msgs)
+            cb = _UsageCollector()
+            resp = model_obj.invoke(msgs, config={"callbacks": [cb]})
+            cb.drain(_llm_role(model_obj))   # token/缓存记账, 统计异常已在内部吞掉
+            log_ai_event("调用", action or "通用调用",
+                         MODEL_NAMES.get(_llm_role(model_obj), ""), _first_human_excerpt(msgs))
+            return resp
         except Exception as e:
             msg = str(e)
             # ① 思考模式被拒：确定性错误，直接降级换实例
@@ -150,6 +281,13 @@ class over_all_state(MessagesState):
     dataset: Annotated[str, '题目给出的数据集']
     modeling_approach: Annotated[str, '建模手自己的思路']
     modeling_analysis: Annotated[str, '模型分析出的基础思路']
+    plan_struct: Annotated[str, '结构化建模方案(JSON文本:problem_type/objective/constraints等)'] = ''
+    # methods 用覆盖语义(无 reducer):modeling 每次全量重算候选方法集,打回重做时不会累积旧值
+    # 形态:modeling 产出初版(List[str] 查表兜底),debate_plan 升级为方法卡列表
+    # (List[dict]: name/paradigm/rationale/assumption/tools);下游节点兼容两种形态。
+    methods: List[str] = []
+    # 建模辩论未决分歧(issue/adopter/status/note),随 Send 下发各方法作为可发挥空间
+    disagreements: Annotated[List[dict], '建模辩论未决分歧,随 Send 下发'] = []
     retry_count: Annotated[int, '工具重试计数'] = 0
     tool_rounds: Annotated[int, '工具调用总轮数'] = 0
     review_feedback: Annotated[str, '审核意见'] = ''
@@ -191,6 +329,16 @@ class FeedbackVerdict(TypedDict):
 
 model_feedback_struct = struct_model.with_structured_output(schema=FeedbackVerdict)
 
+# debate_plan 收口:把修订后的建模方案强制结构化(格式硬保证,不走围栏解析软路)
+class PlanStruct(TypedDict):
+    problem_type: Annotated[str, '题目类型(优化/预测/评价/分类/机理,单选)']
+    variables: Annotated[List[str], '决策变量及含义']
+    objective: Annotated[str, '目标函数表达式或文字描述']
+    constraints: Annotated[List[str], '约束条件列表']
+    per_question_method: Annotated[Dict[str, str], '每问采用的方法']
+
+model_plan_struct = struct_model.with_structured_output(schema=PlanStruct)
+
 #质检节点:求解结果汇总后、汇合前,用结构化输出判断建模方案是否可信
 #不通过则打回 modeling 重做(清空 operator.add 系字段防止污染),最多迭代 3 次强制放行
 def feedback_check(state: over_all_state):
@@ -207,10 +355,16 @@ def feedback_check(state: over_all_state):
 
     problem_str = state["problem_str"]
     analysis = state.get("modeling_analysis") or ""
+    # answers 结构是 [{方法名: 结果文本}, ...]——先按方法名合并,再取文本摘要;
+    # 旧实现读 a['question']/a['answer'] 与真实结构不符,质检摘要恒为空,已修正
+    merged = {}
+    for item in answers:
+        for k, v in item.items():
+            merged.setdefault(k, []).append(v)
     brief = "\n".join(
-        f"- 问题{a.get('question', '?')}: {str(a.get('answer', ''))[:500]}"
-        for a in answers[:10]
-    )
+        f"- 方法《{k}》: {str(text)[:500]}"
+        for k, texts in merged.items() for text in texts[:3]
+    ) or "(无结果摘要)"
     failed = state.get("failed_qs") or []
     failed_str = "；".join(failed) if failed else "无"
 
@@ -245,6 +399,7 @@ def feedback_check(state: over_all_state):
             "code_files": RESET,
             "failed_qs": RESET,
             "done_pairs": RESET,
+            "disagreements": [],   # 覆盖语义无 reducer,清空只能用 [];防上轮辩论的旧分歧点残留给本轮 worker
             "review_feedback": "",       # 清掉旧审核意见,避免 modeling 误判为审核打回
             "retry_count": 0,
             "tool_rounds": 0,
@@ -289,6 +444,30 @@ def _extract_json_obj(text: str) -> dict:
         raise ValueError("JSON 不是对象")
     return obj
 
+def _extract_last_json_fence(text: str) -> tuple[dict, str]:
+    """从文本的 ``` 围栏块中自后向前找第一个能整体解析成 JSON 对象的块,
+    返回 (方案, 剥掉该块后的正文);找不到抛 ValueError。
+    不锚定输出末尾:模型在围栏后补总结语、正文含 LaTeX 花括号都不影响;
+    自后向前也保证正文更早处的 JSON 样例块不会被误当成方案。"""
+    parts = re.split(r"(```[a-zA-Z0-9]*\s*)", text or "")
+    # parts 偶数位是围栏外正文,奇数位是围栏标记(开栏/闭栏交替,开栏在奇数位)
+    for j in range(len(parts) - 2, 0, -1):
+        if j % 2 == 0:
+            continue
+        content = parts[j + 1].strip() if j + 1 < len(parts) else ""
+        if not (content.startswith("{") and content.endswith("}")):
+            continue
+        try:
+            obj = json.loads(content)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        # 整块 = 开栏标记(j) + 块内容(j+1) + 闭栏标记(j+2);未闭合的尾块同样剥除
+        cleaned = "".join(parts[:j]) + "".join(parts[j + 3:])
+        return obj, cleaned
+    raise ValueError("围栏块中未找到可解析的 JSON 对象")
+
 #对文本进行格式化用来初始化problem_str和problem_index。
 #固定走 struct_model(DeepSeek 非思考)——不随前端切换模型变化,规避强制思考模型
 #拒绝 with_structured_output 强制 tool_choice 的 400;三层降级保证流程不中断
@@ -317,7 +496,10 @@ def question_structed(state:over_all_state) ->structed_output_state:
     # 第一层:结构化输出(固定 DeepSeek 非思考实例)
     try:
         _log_llm(model_with_struct, "问题提取·结构化")
-        resp = model_with_struct.invoke([HumanMessage(prompt)])
+        cb = _UsageCollector()
+        resp = model_with_struct.invoke([HumanMessage(prompt)], config={"callbacks": [cb]})
+        cb.drain("struct")
+        log_ai_event("调用", "问题提取·结构化", "deepseek", _first_human_excerpt([HumanMessage(prompt)]))
         if isinstance(resp, dict) and resp.get("problem_str"):
             return _finalize(str(resp["problem_str"]), resp.get("problem_index"), "已成功提取问题索引")
         logger.warning(f"question_structed 结构化返回异常(resp={resp!r})，转手动解析")
@@ -327,7 +509,11 @@ def question_structed(state:over_all_state) ->structed_output_state:
     # 第二层:同一 DeepSeek 实例的普通文本调用 + 手动 JSON 解析
     try:
         _log_llm(struct_model, "问题提取·文本回退")
-        raw = struct_model.invoke([HumanMessage(prompt)]).content
+        cb = _UsageCollector()
+        raw_resp = struct_model.invoke([HumanMessage(prompt)], config={"callbacks": [cb]})
+        cb.drain("struct")
+        log_ai_event("调用", "问题提取·文本回退", "deepseek", _first_human_excerpt([HumanMessage(prompt)]))
+        raw = raw_resp.content
         data = _extract_json_obj(raw)
         if data.get("problem_str"):
             return _finalize(str(data["problem_str"]), data.get("problem_index"), "已通过文本模式提取问题索引")
@@ -378,13 +564,14 @@ def modeling(state: over_all_state) -> over_all_state:
         modeling_approach = ""
     else:
         modeling_approach = interrupt('请简述你的建模思路（可直接回车跳过）') or ""
+        log_ai_event("人工审查", f"建模思路人工确认: {'提供了人工思路' if modeling_approach.strip() else '跳过,由模型自行构思'}")
     problem_str = state["problem_str"]
     problem_index = state["problem_index"]
     dataset = state.get("dataset")
 
     system_prompt = (
         "你是一名顶级的数学建模手。请严格遵循以下步骤对题目进行深度分析：\n"
-        "1. 问题定性（优化/预测/评价/分类）\n"
+        "1. 问题定性（优化/预测/评价/分类/机理）\n"
         "2. 数据洞察与预处理建议\n"
         "3. 合理假设\n"
         "4. 数学模型构建（目标函数+约束条件）\n"
@@ -392,7 +579,18 @@ def modeling(state: over_all_state) -> over_all_state:
         "6. 优劣势分析\n"
         "题目与数据已完整提供，通常无需调用工具；如需查资料请用 search。\n"
         "若调用 read_workspace，work_dir 参数必填，只能是 code/paper/photo/dataset 之一，例如 read_workspace(work_dir=\"paper\", rel_path=\"问题1_思路.md\")。\n"
-        "若工具连续报错，请根据你的常识完成分析。"
+        "若工具连续报错，请根据你的常识完成分析。\n"
+        "【重要·结构化方案】在分析文字的最后，用 ```json 代码围栏额外输出一份结构化建模方案"
+        "（供后续求解节点直接消费，务必与你的分析一致），格式：\n"
+        "{\n"
+        '  "problem_type": "题目类型(优化/预测/评价/分类/机理，单选)",\n'
+        '  "variables": ["决策变量1及含义", "决策变量2及含义"],\n'
+        '  "objective": "目标函数表达式(如 max 3x1+4x2)",\n'
+        '  "constraints": ["约束1表达式(如 2x1+4x2<=200)", "约束2表达式"],\n'
+        '  "per_question_method": {"问题1": "该问建议采用的方法", "问题2": "..."}\n'
+        "}\n"
+        "若无法给出具体表达式，objective/constraints 填简要文字描述即可，不得省略整个 JSON。\n"
+        "输出完上述 ```json 围栏后立即结束本次回复，围栏之后不要再输出任何文字。"
     )
 
     user_parts = [
@@ -421,11 +619,29 @@ def modeling(state: over_all_state) -> over_all_state:
     response = _invoke_llm(model_to_use, [
         SystemMessage(content=system_prompt),
         HumanMessage(content=user_message)
-    ])
+    ], action="建模分析")
+
+    # 提取结构化方案:先扫 ``` 围栏自后向前取方案(容错围栏后补话/正文花括号),
+    # 失败再退回通用提取;成功时把方案块从正文剥掉,JSON 只经 plan_struct 下发
+    plan_struct, methods = "", []
+    analysis_text = response.content
+    try:
+        try:
+            plan, analysis_text = _extract_last_json_fence(response.content)
+        except ValueError:
+            plan = _extract_json_obj(response.content)
+        ptype = str(plan.get("problem_type") or "").strip()
+        methods = TYPE_METHODS.get(ptype) or METHODS_FALLBACK
+        plan_struct = json.dumps(plan, ensure_ascii=False, indent=2)
+        logger.info(f"modeling 结构化为类型「{ptype}」, 派发方法: {methods}")
+    except Exception as e:
+        logger.warning(f"modeling 结构化方案解析失败({e})，将沿用固定方法集")
 
     return {
         "messages": [response],          # 追加 AI 回复
-        "modeling_analysis": response.content,
+        "modeling_analysis": analysis_text,  # 已剥掉方案围栏,JSON 只走 plan_struct
+        "plan_struct": plan_struct,      # 结构化方案(JSON文本), 供 worker/论文直接消费
+        "methods": methods or METHODS_FALLBACK,  # 本轮的候选方法集(类型感知)
         "retry_count": retry_count,      # 更新重试计数器
         "tool_rounds": tool_rounds       # 更新工具轮数
     }
@@ -498,16 +714,157 @@ def review_modeling_analysis(state: over_all_state) -> Command:
     feedback = (feedback or "").strip()
     if not feedback or feedback in ("通过", "同意", "ok", "OK", "好", "可以"):
         logger.info('建模手审核通过，进入下一环节')
+        log_ai_event("人工审查", "建模分析人工审核: 通过")
         return Command(update={"review_feedback": "", "review_result": "passed", "retry_count": 0, "tool_rounds": 0}, goto="send_problem_index")
     logger.info(f"建模手打回，审核意见：{feedback}")
-    return Command(update={"review_feedback": feedback, "review_result": "rework", "retry_count": 0, "tool_rounds": 0}, goto="modeling")
+    log_ai_event("人工审查", f"建模分析人工审核: 打回重做, 意见: {feedback[:120]}")
+    # disagreements 随被丢弃的旧方案一并清空:它只在 debate_plan 写入,若重跑时辩论
+    # 静默降级,残留的旧分歧点会配着新方案下发给 worker(与质检打回同一处理)
+    return Command(update={"review_feedback": feedback, "review_result": "rework", "retry_count": 0, "tool_rounds": 0, "disagreements": []}, goto="modeling")
 
 
-#四个工作节点的固定方法分工
-METHODS = ["解析法", "数值模拟法", "数据驱动法", "启发式优化法"]
+# 候选方法集:按题目类型(problem_type)选派,替代"固定四法硬跑",避免方法凑数。
+# METHODS_FALLBACK 兜底:类型判定缺失/失败时沿用原固定四法,保证流程不中断。
+TYPE_METHODS = {
+    "优化": ["精确规划", "启发式优化", "数值枚举"],
+    "预测": ["机理建模", "统计回归", "机器学习"],
+    "评价": ["层次分析", "熵值法", "模糊综合评价"],
+    "分类": ["判别分类", "聚类分析"],
+    "机理": ["微分方程解析", "数值仿真"],
+}
+# 兜底方法集:类型判定失败时启用,选三个"几乎万能"的方法,保证任何题都有可用求解路径
+METHODS_FALLBACK = ["机理建模", "统计建模", "智能优化"]
 
 #建模阶段工具调用总轮数上限,防止模型反复调工具死循环
 MAX_TOOL_ROUNDS = 6
+
+# ---------- 建模辩论节点：质疑者攻击初稿 → 修订者收敛 → 收口保格式 ----------
+# 目标:给"决策层"加独立于生成者的审阅——质疑者独立读题面攻击分类/假设/目标函数,
+# 修订者逐条回应产出修订版 plan_struct + 方法卡集 + 分歧点。
+# 铁律:任一步失败(调用/解析/校验)都静默降级——原样返回 modeling 初稿,行为等同改前,
+# 绝不让新节点成为全链路的新单点。
+def debate_plan(state: over_all_state) -> dict:
+    logger.info('正在运行 debate_plan 节点')
+    draft = state.get("plan_struct") or ""
+    if not draft:
+        logger.warning('debate_plan: 无建模初稿,直接放行')
+        return {}
+    problem_str = state.get("problem_str") or ""
+    problem_index = state.get("problem_index") or {}
+    analysis = state.get("modeling_analysis") or ""
+    initial_methods = state.get("methods") or METHODS_FALLBACK
+
+    # ---- 1. 质疑者:独立读题面,只质疑不改写 ----
+    critic_prompt = (
+        "你是数学建模方案的独立质疑者,任务是**只质疑、不改写**。\n"
+        "你独立阅读题目与建模初稿,找出其中真正的问题。\n"
+        f"【题目】{problem_str}\n"
+        f"【各小问】{problem_index}\n"
+        f"【建模分析】{analysis}\n"
+        f"【建模初稿 plan_struct】\n{draft}\n\n"
+        "请从以下四个角度逐条质疑,只输出质疑清单,不要修改方案:\n"
+        "1. 分类质疑:这题真的属于该 problem_type 吗?给出证据;\n"
+        "2. 假设风险:哪些假设不成立、遗漏或过于理想;\n"
+        "3. 目标函数/约束:可解性、量纲、缺失约束;\n"
+        "4. 方法集建议:若分类错误,候选方法集应换成什么范式组合(机理/数据/仿真)。\n"
+        "格式:最后用 ```json 代码围栏输出质疑清单 JSON:\n"
+        '{"criticisms": [{"type": "分类|假设|目标|方法", "issue": "...", "evidence": "..."}]}\n'
+        "围栏后不要再输出任何文字。"
+    )
+    criticisms = []
+    try:
+        critic_resp = _invoke_llm(model_text, [HumanMessage(critic_prompt)], action="辩论·质疑者")
+        try:
+            plan_json, _ = _extract_last_json_fence(critic_resp.content)
+            criticisms = plan_json.get("criticisms") or []
+        except Exception:
+            criticisms = []
+    except Exception as e:
+        logger.warning(f'debate_plan 质疑者调用失败,静默降级: {e}')
+        return {}
+    if not criticisms:
+        logger.info('debate_plan: 质疑者未提出有效质疑,采用初稿继续修订')
+
+    # ---- 2. 修订者:逐条回应,产出修订版方案+方法卡+分歧点 ----
+    critic_block = "\n".join(
+        f"- [{c.get('type', '')}] {c.get('issue', '')} (证据: {c.get('evidence', '')})"
+        for c in criticisms[:10] if isinstance(c, dict) and c.get('issue')
+    ) or "(质疑者未提出具体质疑)"
+    methods_line = "、".join(str(m) for m in initial_methods) or "、".join(METHODS_FALLBACK)
+    reviser_prompt = (
+        "你是数学建模方案的修订者。建模初稿被独立质疑者攻击,请逐条回应并修订。\n"
+        "规则:合理的质疑必须采纳;不合理的可以拒绝,但必须在 disagreements 里记录理由。\n"
+        f"【题目】{problem_str}\n"
+        f"【建模分析】{analysis}\n"
+        f"【初版 plan_struct】\n{draft}\n"
+        f"【质疑清单】\n{critic_block}\n"
+        f"【初版候选方法】{methods_line}\n\n"
+        "输出(```json 围栏包裹,围栏后不要输出任何文字):\n"
+        "{\n"
+        '  "plan_struct": { 修订后的方案,字段与初稿一致: problem_type/variables/objective/constraints/per_question_method },\n'
+        '  "methods": [ 方法卡数组,3个,覆盖不同范式(机理/数据/仿真),每项: {"name":"方法名", "paradigm":"范式", "rationale":"为什么用", "assumption":"该方法独立假设", "tools":"典型算法"} ],\n'
+        '  "disagreements": [ {"issue":"争议点", "adopter":"质疑者|修订者", "status":"未解决|已解决", "note":"说明"} ]\n'
+        "}"
+    )
+    rev_plan, rev_methods, rev_dis = {}, [], []
+    try:
+        reviser_resp = _invoke_llm(model_text, [HumanMessage(reviser_prompt)], action="辩论·修订者")
+        try:
+            rev_json, _ = _extract_last_json_fence(reviser_resp.content)
+            rev_plan = rev_json.get("plan_struct") or {}
+            rev_methods = rev_json.get("methods") or []
+            rev_dis = rev_json.get("disagreements") or []
+        except Exception as e:
+            logger.warning(f'debate_plan 修订者输出解析失败,静默降级: {e}')
+            return {}
+        if not rev_plan or not isinstance(rev_methods, list) or not rev_methods:
+            logger.warning('debate_plan 修订输出不完整(缺 plan_struct 或 methods),静默降级')
+            return {}
+    except Exception as e:
+        logger.warning(f'debate_plan 修订者调用失败,静默降级: {e}')
+        return {}
+
+    # ---- 3. 收口:修订版方案强制结构化(格式硬保证),失败则用修订版原文 ----
+    try:
+        struct_out = _invoke_llm(model_plan_struct, [
+            HumanMessage(
+                "把下面的建模方案整理成严格符合 schema 的结构化输出,保持所有数值与内容不变:\n"
+                + json.dumps(rev_plan, ensure_ascii=False)
+            )
+        ], action="辩论·收口")
+        plan_struct = json.dumps(dict(struct_out), ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f'debate_plan 收口失败,采用修订版原文: {e}')
+        plan_struct = json.dumps(rev_plan, ensure_ascii=False, indent=2)
+
+    # 方法卡兜底:过滤字段不完整的,只保留合法项
+    cleaned = []
+    for m in rev_methods[:3]:
+        if not isinstance(m, dict) or not m.get("name"):
+            continue
+        cleaned.append({
+            "name": str(m.get("name")),
+            "paradigm": str(m.get("paradigm") or "通用"),
+            "rationale": str(m.get("rationale") or ""),
+            "assumption": str(m.get("assumption") or ""),
+            "tools": str(m.get("tools") or ""),
+        })
+    if not cleaned:
+        logger.warning('debate_plan 方法卡全部无效,静默降级用初版方法集')
+        return {}
+
+    disagreements = [
+        {"issue": str(d.get("issue", "")), "adopter": str(d.get("adopter", "修订者")),
+         "status": str(d.get("status", "未解决")), "note": str(d.get("note", ""))}
+        for d in rev_dis if isinstance(d, dict) and d.get("issue")
+    ][:10]
+
+    logger.info(f'debate_plan 完成: 修订 plan_struct, 方法卡 {len(cleaned)} 张, 分歧 {len(disagreements)} 条')
+    return {
+        "plan_struct": plan_struct,
+        "methods": cleaned,
+        "disagreements": disagreements,
+    }
 
 #执行代码用的 Python 解释器:默认跟随当前运行环境(与 agent 同一解释器),可用环境变量 MATH_PYTHON_EXE 覆盖
 PYTHON_EXE = os.environ.get("MATH_PYTHON_EXE") or sys.executable
@@ -546,11 +903,14 @@ def send_problem_index(state: over_all_state) -> dict:
     logger.warning('problem_index 为空，已把整题作为「问题1」兜底')
     return {"problem_index": {"问题1": fallback}}
 
-#屏障节点:四个方法×全部小问都交卷后才放行到 run_solutions,避免汇总读到部分结果
+#屏障节点:候选方法×全部小问都交卷后才放行到 run_solutions,避免汇总读到部分结果
 def collect_branches(state: over_all_state) -> dict:
     problem_index = state.get("problem_index") or {}
     qs = sorted(problem_index.keys(), key=_num_key)
-    needed = {f"{m}|{k}" for m in METHODS for k in qs}
+    methods = state.get("methods") or METHODS_FALLBACK
+    # 兼容方法卡(dict)与字符串:统一取方法名,与 solve_with_method 的 done_pairs 口径一致
+    mnames = [(m.get("name") if isinstance(m, dict) else str(m)) for m in methods if m]
+    needed = {f"{mn}|{k}" for mn in mnames for k in qs}
     got = set(state.get("done_pairs") or [])
     if needed and needed <= got:
         return Command(goto="run_solutions", update={})
@@ -564,21 +924,33 @@ def dispatch_sends(state: over_all_state) -> list:
         return [Send("compare_summarize", {})]
     ddir = dataset_dir()
     dataset_files = "\n".join(sorted(f.name for f in ddir.iterdir() if f.is_file())) if ddir.is_dir() else "(dataset 目录为空)"
-    return [
-        Send("solve_with_method", {
-            "method": m,
+    cards = state.get("methods") or METHODS_FALLBACK
+    disagreements = state.get("disagreements") or []
+    # 兼容两种形态:debate_plan 产出的方法卡(dict)或 modeling 初版的字符串方法名
+    sends = []
+    for c in cards:
+        if isinstance(c, dict) and c.get("name"):
+            name, card = str(c["name"]), c
+        else:
+            name, card = str(c), None
+        sends.append(Send("solve_with_method", {
+            "method": name,
+            "method_card": card,
+            "disagreements": disagreements,
             "problem_index": problem_index,
             "modeling_analysis": state.get("modeling_analysis") or "",
+            "plan_struct": state.get("plan_struct") or "",
             "dataset_files": dataset_files,
-        })
-        for m in METHODS
-    ]
+        }))
+    return sends
 
 #工作节点:单次调用内依次解决所有小问。method 来自 Send 输入全程有效,
 #工具循环也在节点内就地完成,避免分支身份经图节点往返丢失(旧实现曾导致 method 变为"未知方法")
 def solve_with_method(state: over_all_state) -> dict:
     method = state.get("method") or "未知方法"
     logger.info(f'正在运行 solve_with_method 节点: {method}')
+    method_card = state.get("method_card") or {}
+    disagreements = state.get("disagreements") or []
     problem_index = state.get("problem_index") or {}
     results_parts = []
     code_files = []
@@ -586,10 +958,27 @@ def solve_with_method(state: over_all_state) -> dict:
 
     for q_key in sorted(problem_index.keys(), key=_num_key):
         q_text = problem_index[q_key]
+        card_block = ""
+        if isinstance(method_card, dict) and method_card.get("name"):
+            card_block = (
+                f"【方法卡】\n"
+                f"建模范式: {method_card.get('paradigm', '')}\n"
+                f"方法依据: {method_card.get('rationale', '')}\n"
+                f"你的独立假设(可偏离共享方案之处): {method_card.get('assumption', '')}\n"
+                f"可用工具/算法: {method_card.get('tools', '')}\n"
+            )
+        dis_block = ""
+        if disagreements:
+            dis_block = "【未决分歧点】(可按下述立场展开,也可给出你的判断):\n" + "\n".join(
+                f"- {d.get('issue', '')}" for d in disagreements[:5] if isinstance(d, dict)
+            ) + "\n"
         prompt = (
             f"你正在用《{method}》解答数学建模问题。\n"
             f"当前小问: {q_key}\n题干:\n{q_text}\n"
             f"整体建模分析:\n{state.get('modeling_analysis') or '(无)'}\n"
+            + card_block
+            + dis_block
+            + f"结构化建模方案(共享骨架;除上方方法卡假设与分歧点外保持一致):\n{state.get('plan_struct') or '(无)'}\n"
             f"数据集文件清单(dataset 目录):\n{state.get('dataset_files') or '(无)'}\n\n"
             "数据说明: 上方清单中的文件位于本机 dataset/ 目录,"
             "代码中应通过 r\"..\\dataset\\文件名\" 读取真实数据,禁止编造数据。\n"
@@ -723,6 +1112,23 @@ def _run_error_msg(r: dict, timeout: int) -> str:
     return ""
 
 
+# 脚本运行输出留档: 图会存进 photo/, 但 stdout 里的数值结果此前只活在内存的 run_report
+# (且每脚本仅保留末尾 1200 字符), 程序一关数据就丢。这里把完整 stdout/stderr 落盘到
+# code/logs/{脚本名}.log——数值与图一并留档, 且不受截断, 供复核与支撑材料使用。
+def _save_run_log(rel: str, r: dict) -> None:
+    try:
+        log_dir = code_dir() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        body = (f"# {rel} 运行输出留档\n"
+                f"# 时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"# returncode: {r['returncode']}  timed_out: {r['timed_out']}\n"
+                f"--- stdout ---\n{r['stdout'] or '(无)'}\n"
+                f"--- stderr ---\n{r['stderr'] or '(无)'}\n")
+        (log_dir / f"{Path(rel).stem}.log").write_text(body, encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"运行输出留档失败({rel}): {e}")
+
+
 # 提交 LLM 诊断并重写脚本:成功写回磁盘返回 True,否则 False
 def _llm_fix_script(script: Path, error_log: List[str], expected: List[str]) -> bool:
     try:
@@ -747,7 +1153,7 @@ def _llm_fix_script(script: Path, error_log: List[str], expected: List[str]) -> 
         "只输出代码块，不要多余解释。"
     )
     try:
-        resp = _invoke_llm(model_text, [HumanMessage(prompt)])
+        resp = _invoke_llm(model_text, [HumanMessage(prompt)], action="求解代码·失败诊断修复")
     except Exception as e:
         logger.error(f"LLM 修复调用失败: {e}")
         return False
@@ -805,6 +1211,7 @@ def run_solutions(state: over_all_state) -> dict:
         if r is None:
             continue
         timeout = RUN_TIMEOUT
+        _save_run_log(rel, r)
         msg = _run_error_msg(r, timeout)
         if msg:
             reports.append({"file": rel, "status": f"失败: {msg}",
@@ -872,6 +1279,7 @@ def run_solutions(state: over_all_state) -> dict:
             if success:
                 break
 
+        _save_run_log(rel, r)   # 无论成败, 完整输出留档 code/logs/
         if not success:
             failed.append((rel, script, error_log))
             reports.append({"file": rel, "status": f"失败:经 {RUN_RETRY} 次重试 + {LLM_MAX_FIX} 轮 LLM 修复仍未能出图"})
@@ -898,9 +1306,11 @@ def run_solutions(state: over_all_state) -> dict:
         if skip:
             for rel, _, _ in failed:
                 reports.append({"file": rel, "status": "已由人工选择跳过"})
+            log_ai_event("人工审查", "出图失败人工处置: 选择跳过失败脚本")
             break
         # 明确要求重试:本轮 resume 的重跑已在上方执行过;若仍失败则回到循环顶部再次询问
         logger.info(f"人工选择重试(反馈: {fb[:50]}),仍有 {len(failed)} 个失败脚本")
+        log_ai_event("人工审查", f"出图失败人工处置: 要求重试(反馈: {fb[:80]})")
 
     return {"run_report": reports}
 
@@ -929,19 +1339,39 @@ def compare_summarize(state: over_all_state) -> dict:
     msgs = state.get("compare_msgs") or []
     #工具刚返回:延续对话,让模型看到工具结果后继续
     if msgs and isinstance(msgs[-1], ToolMessage):
-        resp = _invoke_llm(model_think_tool, msgs)
+        resp = _invoke_llm(model_think_tool, msgs, action="汇总对比·工具续答")
         to_append = []
     else:
         if not merged:
-            final = "(四个方法均未产出结果,无法对比总结)"
+            final = "(候选方法均未产出结果,无法对比总结)"
             write_workspace.invoke({"work_dir": "paper", "rel_path": "最终总结.md", "content": final})
             return {"final_summary": final}
         input_text = "\n\n".join(f"### 方法《{k}》\n" + "\n".join(vs) for k, vs in merged.items())
+        method_names = list(merged.keys())
+        method_line = "、".join(method_names) if method_names else "(无)"
         fb = (state.get("human_feedback") or "").strip()
         feedback_line = f"人工审核意见(务必据此修改最终总结): {fb}\n\n" if fb else ""
+        # 注入各分支范式与未决分歧,让总评知道这是跨范式的独立估计(交叉验证依据)
+        paradigm_line = ""
+        mc = state.get("methods") or []
+        if mc:
+            parts = []
+            for c in mc:
+                if isinstance(c, dict) and c.get("name"):
+                    parts.append(f"{c.get('name')}(范式:{c.get('paradigm', '')})")
+            if parts:
+                paradigm_line = f"各分支范式(交叉验证依据): {'、'.join(parts)}\n\n"
+        dis_line = ""
+        dis = state.get("disagreements") or []
+        if dis:
+            dis_line = "建模阶段未决分歧(总评需裁决或标注待人工确认):\n" + "\n".join(
+                f"- {d.get('issue', '')}({d.get('adopter', '')}坚持, {d.get('status', '')})"
+                for d in dis[:5] if isinstance(d, dict)
+            ) + "\n\n"
         prompt = (
-            "你是数学建模竞赛的总评专家。以下是用四种不同方法解答同一份题目的答卷,以及代码实际运行情况。\n"
+            f"你是数学建模竞赛的总评专家。以下是用 {len(method_names)} 种方法({method_line})解答同一份题目的答卷,以及代码实际运行情况。\n"
             f"题目小问: {list(problem_index.keys())}\n\n"
+            f"{paradigm_line}{dis_line}"
             f"{input_text}\n\n"
             f"代码运行情况:\n{run_text or '(无运行报告)'}\n\n"
             f"{feedback_line}"
@@ -950,15 +1380,15 @@ def compare_summarize(state: over_all_state) -> dict:
             "最终结论里的每一个关键数值都必须能在运行输出或各方法答卷的求解结果中找到出处,"
             "严禁自行编造、估计或'合理化'数值;若某问缺少可信数值,如实写'该问数值待运行确认',不要虚构。\n"
             "请输出一份对比总结 Markdown 文档:\n"
-            "1. 逐问对比四种方法的结论,标出结论一致与分歧之处;\n"
+            "1. 逐问对比各方法的结论,标出结论一致与分歧之处;\n"
             "2. 结合代码运行情况(成功/失败/生成的图),说明结果可信度;\n"
             "3. 对每一问给出最可信的最终结论(可综合多种方法),并简要说明理由;\n"
             "4. 整篇文档结构完整,可直接作为《最终总结》;\n"
-            "5. 对每一问明确标注:最终采用的方法(从四种中选定)+一句话理由+该问关键数值结果清单"
+            "5. 对每一问明确标注:最终采用的方法(从上述方法中选定)+一句话理由+该问关键数值结果清单"
             "(供论文撰写章节直接引用,数值必须与前述结论一致)。\n\n"
             f"【中文写作规范(去 AI 味,务必严格遵循)】\n{read_writing_skill('de-AI')}"
         )
-        resp = _invoke_llm(model_think_tool, [HumanMessage(prompt)])
+        resp = _invoke_llm(model_think_tool, [HumanMessage(prompt)], action="汇总对比总结")
         to_append = [HumanMessage(prompt)]
 
     #模型想调工具:交给工具节点,工具结果会自动回到本节点继续
@@ -980,7 +1410,9 @@ def final_analysis(state:over_all_state) ->Command:
     )
     feedback=(feedback or '').strip()
     if not feedback or any(k in feedback for k in ('通过','认可')):
+        log_ai_event("人工审查", "最终总结人工审查: 认可")
         return Command(goto="fill_document_meta")
+    log_ai_event("人工审查", f"最终总结人工审查: 打回修改, 意见: {feedback[:120]}")
     return Command(goto='compare_summarize', update={
         'human_feedback': feedback,
         'compare_msgs': [RemoveMessage(id=m.id) for m in (state.get("compare_msgs") or []) if getattr(m, "id", None)],
@@ -1003,7 +1435,7 @@ ARTICLE_CHAPTERS = [
      "摘要：300~600字，严格按 Nature 式'背景/动机→问题→方法/模型→结果(定量)→意义'证据链组织，"
      "每段以结论或定量结果开头（结果先行），杜绝空话与'首先/其次/最后'式机械连接词。"
      "首段一句话点出研究背景与动机；随后按'针对问题一/问题二/...'逐问成段，每段先写该问最终采用的"
-     "方法（从解析法/数值模拟法/数据驱动法/启发式优化法中选定的最适一种）与所用模型，"
+     "方法（从【候选方法清单】中选定的最适一种，只写该方法名与所用模型）与所用模型，"
      "紧接着给出关键定量结果（必须写具体数字，如'最优组合(20,40)、最大利润220元'，亮点突出）；"
      "末段一句话写优化推广（该建模思路在何类问题可迁移），不展开。"
      "结尾用 \\keywords{关键词1\\quad 关键词2...}（3~5个，必须含模型名与方法名亮点）。只接受文字，不要图表。"),
@@ -1013,7 +1445,7 @@ ARTICLE_CHAPTERS = [
     ("3ProblemAnalysis",
      "问题分析：\\section{问题分析}，对各小问分别 \\subsection{问题X分析} 写数据洞察与建模思路，"
      "对应 problem_index 的每个小问；并在每问分析末用一句话自然给出'本问拟采用的最适方法及理由'"
-     "（从解析法/数值模拟法/数据驱动法/启发式优化法中选定，依据最终总结中的对比），为后文建模章节定主线。"
+     "（从【候选方法清单】中选定，依据最终总结中的对比），为后文建模章节定主线。"
      "要求：数据洞察尽量带具体数字（如'果汁单瓶利润4元、利润率100%'）；方法理由用逻辑自然衔接，"
      "避免'首先/其次/最后'式套话；整体遵循 Nature 式'问题→方法→结果'简明证据链，不写空话。"),
     ("4AssumptionAndSign",
@@ -1039,8 +1471,8 @@ ARTICLE_CHAPTERS = [
      "'推广'须写成可迁移性——指出该建模思路/方法在哪些同类问题可复用、需如何调整，而非空泛一句；"
      "整体遵循 Nature 式'意义/讨论'导向。"),
     ("8Reference",
-     "参考文献：用 thebibliography 环境（\\bibitem{ref01}...），按 GB/T 7714 风格列出正文中实际引用文献；"
-     "若用到了 AI 工具，按模板注释格式补充 AI 使用声明条目。"),
+     "参考文献：用 thebibliography 环境（\\bibitem{ref01}...），按 GB/T 7714 风格列出正文中实际引用文献。"
+     "AI 工具使用声明由系统单独成节（置于本节之前），本节不要写任何 AI 声明内容。"),
     ("9Appendix",
      "附录：\\appendix。\\section{详细图表} 索引；\\section{代码程序} 用 "
      "\\lstinputlisting[style=Python, caption={...}]{code/文件名.py} 列出'求解代码文件'中每个 py；"
@@ -1160,7 +1592,7 @@ def _fix_latex_with_llm(errors: List[Dict[str, str]]) -> List[str]:
         "===FILE: texfile/文件名.tex===\n修复后的完整文件内容\n===END==="
     )
     try:
-        resp = _invoke_llm(model_text, [HumanMessage("\n\n".join(parts))])
+        resp = _invoke_llm(model_text, [HumanMessage("\n\n".join(parts))], action="论文·编译错误修复")
     except Exception as e:
         logger.error(f"LLM 修复编译错误调用失败: {e}")
         return []
@@ -1174,6 +1606,169 @@ def _fix_latex_with_llm(errors: List[Dict[str, str]]) -> List[str]:
     return fixed
 
 
+# ---------- 2026 AI 使用规定的合规产物: 声明章节 + 《AI 工具使用详情》 ----------
+# 全部程序化拼装,不经 LLM——规定给了逐字模板,合规文本不允许模型自由发挥。
+
+# AI 使用环节分类: (环节名, 动作关键词, 详情说明, 声明中的用途短语)
+_AI_CATEGORIES = [
+    ("题目信息提取", ("问题提取",), "用结构化提示从题面提取小问索引与完整题干", "题目信息提取"),
+    ("建模分析与质检", ("建模分析", "建模质检"), "基于题面与数据集生成建模分析,并对方案做结构化质检", "建模方案分析"),
+    ("建模方案辩论", ("辩论",), "质疑者-修订者双角色对建模方案交叉质疑、修订并收敛", "建模方案分析"),
+    ("求解代码生成", ("求解",), "按候选方法逐问生成解题思路与可运行 Python 代码", "求解代码生成"),
+    ("代码调试修复", ("失败诊断", "诊断修复"), "对运行失败的求解/绘图脚本诊断原因并改写修复", "代码调试"),
+    ("结果对比总结", ("汇总对比",), "汇总各方法答卷与代码运行输出,逐问对比并生成最终总结", "结果对比总结"),
+    ("论文撰写", ("论文撰写",), "按国赛 LaTeX 模板逐章撰写论文", "论文撰写与语言润色"),
+    ("论文编译修复", ("编译错误",), "定位并修复论文 LaTeX 编译错误", "论文撰写与语言润色"),
+    ("标题拟定", ("封面标题",), "根据题面拟定论文标题", "标题拟定"),
+]
+
+def _tex_escape(s: str) -> str:
+    """LaTeX 特殊字符转义(人工意见/提示摘录等任意文本嵌入 .tex 前必须过这里)。"""
+    repl = {"\\": r"\textbackslash{}", "&": r"\&", "%": r"\%", "$": r"\$",
+            "#": r"\#", "_": r"\_", "{": r"\{", "}": r"\}",
+            "~": r"\textasciitilde{}", "^": r"\textasciicircum{}"}
+    return "".join(repl.get(c, c) for c in (s or ""))
+
+def _ai_purpose_phrase(events) -> str:
+    """从事件日志按环节规则化提炼声明中的'主要用于'短语(只写出现过的环节)。"""
+    used = []
+    for _name, kws, _desc, phrase in _AI_CATEGORIES:
+        if phrase in used:
+            continue
+        if any(e.get("kind") == "调用" and any(k in e.get("summary", "") for k in kws)
+               for e in events):
+            used.append(phrase)
+    return "、".join(used) if used else "辅助计算与文本整理"
+
+def _build_ai_declaration(events, override_phrase: str = "") -> str:
+    """按 2026 规定固定句式拼装《AI 工具使用声明》。events 为空时生成'未使用'版本。"""
+    events = events or []
+    if not events:
+        body = "本参赛队在竞赛过程中未使用任何 AI 工具。"
+    else:
+        purpose = (override_phrase or "").strip() or _ai_purpose_phrase(events)
+        body = (f"本参赛队在竞赛过程中使用了 AI 工具，主要用于{purpose}，"
+                "详细使用情况见支撑材料。")
+    return "\\newpage\n\n\\section*{AI 工具使用声明}\n\n" + _tex_escape(body) + "\n"
+
+def _ensure_ai_declaration_input() -> None:
+    """确保 document.tex 在参考文献前引入 AI 声明章节。
+    修补而非只改模板: 老工作区已复制的旧 document.tex 也能被治愈。"""
+    doc = latex_out() / "document.tex"
+    if not doc.exists():
+        return
+    text = doc.read_text(encoding="utf-8")
+    if "8aAIDeclaration" in text:
+        return
+    marker = "\\input{texfile/8Reference}"
+    if marker in text:
+        text = text.replace(
+            marker,
+            "\\input{texfile/8aAIDeclaration}%AI 工具使用声明(2026 规定,置于参考文献之前)\n" + marker,
+            1,
+        )
+        doc.write_text(text, encoding="utf-8")
+        logger.info("document.tex 已插入 AI 声明章节")
+
+def _write_ai_details_pdf() -> str:
+    """按 2026 规定生成《AI 工具使用详情.pdf》: 工具版本/使用环节/提示方式/人工核验四节,
+    内容全部来自运行事件与模型注册表,不经 LLM。返回给前端的状态描述。"""
+    events = ai_events_snapshot()
+    out_dir = latex_out() / "ai_details"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    used_models = []
+    for e in events:
+        if e.get("kind") == "调用" and e.get("model") and e["model"] not in used_models:
+            used_models.append(e["model"])
+    if used_models:
+        tool_rows = "\n".join(
+            f"{_tex_escape(MODEL_REGISTRY.get(k, {}).get('label', k))} & "
+            f"{_tex_escape(MODEL_REGISTRY.get(k, {}).get('model', ''))} & OpenAI 兼容 API \\\\"
+            for k in used_models)
+    else:
+        tool_rows = "无 & -- & -- \\\\"
+
+    cat_blocks = []
+    for name, kws, desc, _phrase in _AI_CATEGORIES:
+        evs = [e for e in events if e.get("kind") == "调用"
+               and any(k in e.get("summary", "") for k in kws)]
+        if not evs:
+            continue
+        models = "、".join(sorted({e.get("model", "") for e in evs if e.get("model")})) or "--"
+        excerpt = evs[0].get("detail", "")
+        excerpt_block = (f"\n\n典型提示摘录（节选）：\\begin{{quote}}\\small {_tex_escape(excerpt)}\\end{{quote}}"
+                         if excerpt else "")
+        cat_blocks.append(
+            f"\\subsection*{{ {_tex_escape(name)} }}\n"
+            f"{_tex_escape(desc)}。共调用 {_tex_escape(str(len(evs)))} 次，使用模型：{_tex_escape(models)}。"
+            f"{excerpt_block}"
+        )
+    cat_text = "\n\n".join(cat_blocks) or "本次运行未记录到 AI 调用。"
+
+    human = [e for e in events if e.get("kind") == "人工审查"]
+    human_rows = "\n".join(
+        f"{_tex_escape(e.get('time', ''))} & {_tex_escape(e.get('summary', ''))} \\\\"
+        for e in human) or "无 & -- \\\\"
+
+    now = time.strftime("%Y-%m-%d %H:%M")
+    latex_src = f"""\\documentclass[11pt]{{article}}
+\\usepackage[UTF8]{{ctex}}
+\\usepackage[margin=2.5cm]{{geometry}}
+\\usepackage{{booktabs}}
+\\begin{{document}}
+
+\\begin{{center}}{{\\LARGE\\bfseries AI 工具使用详情}}\\\\[4pt]
+{{\\small 生成时间：{_tex_escape(now)}}}\\end{{center}}
+
+\\section{{所用 AI 工具名称与版本}}
+\\begin{{tabular}}{{lll}}
+\\toprule
+工具 & 模型/版本 & 接入方式 \\\\
+\\midrule
+{tool_rows}
+\\bottomrule
+\\end{{tabular}}
+
+\\section{{使用目的与环节}}
+全部环节均通过 OpenAI 兼容 API 以中文提示词驱动：各环节先按固定模板构建提示词，调用模型后将输出由程序解析落盘或交人工审核。
+
+{cat_text}
+
+\\section{{人工审查与核验情况}}
+系统在流程中设置五类人工确认关卡：建模思路确认、建模分析审核、出图失败处置、最终总结审查、封面信息与声明确认。本次运行记录如下：
+
+\\begin{{tabular}}{{p{{0.22\\textwidth}}p{{0.72\\textwidth}}}}
+\\toprule
+时间 & 关卡与结果 \\\\
+\\midrule
+{human_rows}
+\\bottomrule
+\\end{{tabular}}
+
+\\medskip
+本详情所述内容均为系统自动留存的运行记录，即本次运行中对 AI 输出的采纳、人工修改与核验的主要情况；参赛队据此对 AI 参与完成的内容逐项人工审查与核实，核心建模与分析由参赛队主导完成。
+
+\\end{{document}}
+"""
+    tex = out_dir / "ai_usage_details.tex"
+    tex.write_text(latex_src, encoding="utf-8")
+    xe = _find_xelatex()
+    if not xe:
+        return "未检测到 xelatex，《AI 工具使用详情》仅生成源文件(paper/latex/ai_details/)"
+    try:
+        subprocess.run([xe, "-interaction=nonstopmode", "ai_usage_details.tex"],
+                       cwd=str(out_dir), capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=180)
+    except Exception as e:
+        return f"AI 详情 PDF 编译失败: {e}(源文件在 paper/latex/ai_details/)"
+    pdf = out_dir / "ai_usage_details.pdf"
+    if pdf.exists():
+        shutil.copy(str(pdf), str(ws_root() / "AI 工具使用详情.pdf"))
+        return "《AI 工具使用详情.pdf》已生成于工作区根目录"
+    return "AI 详情 PDF 编译失败(源文件在 paper/latex/ai_details/)"
+
+
 def write_article(state: over_all_state) -> dict:
     logger.info("正在运行 write_article 节点：生成 LaTeX 论文到 paper/latex")
     _ensure_latex_skeleton()
@@ -1181,6 +1776,12 @@ def write_article(state: over_all_state) -> dict:
 
     final_summary = state.get("final_summary") or "(无最终总结)"
     approach = (state.get("modeling_approach") or state.get("modeling_analysis") or "(无思路)")
+    plan_struct = state.get("plan_struct") or ""
+    models = state.get("methods") or METHODS_FALLBACK
+    # methods 可能是方法卡(dict)或方法名(str),统一取名字
+    candidate_methods = "、".join(
+        (m.get("name") if isinstance(m, dict) else str(m)) for m in models if m
+    ) or "、".join(METHODS_FALLBACK)
     problem_str = state.get("problem_str") or ""
     problem_index = state.get("problem_index") or {}
     code_files = state.get("code_files") or []
@@ -1197,6 +1798,17 @@ def write_article(state: over_all_state) -> dict:
             shutil.copy(src, latex_out() / "code" / cf)
 
     skill = read_writing_skill("de-AI")
+    # 汇集求解阶段全部思路与推导(12 份方法答卷的真实运行产物), 原文喂给各章生成:
+    # 不设篇幅预算、不加深度清单——素材给足, 章节厚度由模型按素材自行发挥。
+    idea_texts = []
+    try:
+        for f in sorted((ws_root() / "paper").glob("*_思路.md")):
+            t = f.read_text(encoding="utf-8", errors="replace").strip()
+            if t:
+                idea_texts.append(f"### {f.name}\n{t}")
+    except Exception as e:
+        logger.warning(f"思路素材汇集失败(不影响主流程): {e}")
+    idea_block = "\n\n".join(idea_texts)
     done = []
     for fname, req in ARTICLE_CHAPTERS:
         prompt = (
@@ -1222,7 +1834,10 @@ def write_article(state: over_all_state) -> dict:
             f"【题目全文】{problem_str}\n\n"
             f"【各小问题干】{problem_index}\n\n"
             f"【建模思路】{approach}\n\n"
+            f"【候选方法清单(论文中'采用的模型/方法'只能从其中选用,与最终总结口径一致)】{candidate_methods}\n\n"
+            f"【结构化建模方案(JSON,目标函数/约束/变量可直接用于符号说明与模型建立章节,数值须与其他章节一致)】\n{plan_struct or '(无)'}\n\n"
             f"【最终结论（逐问）】{final_summary}\n\n"
+            f"【求解阶段完整思路与推导素材（来自全部方法答卷的真实运行产物，写本章时可自由取用、展开与引用，不得虚构其中不存在的推导）】\n{idea_block or '(无)'}\n\n"
             f"【可用图片（位于 texfile/figures/）】{figs or '(无)'}\n"
             f"【求解代码文件（位于 code/，供附录引用）】{code_files or '(无)'}\n\n"
             f"【中文写作规范（去 AI 味，务必遵循）】\n{skill}\n\n"
@@ -1238,7 +1853,8 @@ def write_article(state: over_all_state) -> dict:
         )
         target = latex_out() / "texfile" / f"{fname}.tex"
         try:
-            raw = _invoke_llm(model_text, [HumanMessage(prompt)]).content
+            raw_resp = _invoke_llm(model_text, [HumanMessage(prompt)], action=f"论文撰写·{fname}")
+            raw = raw_resp.content
             latex = _strip_tex_fences(raw)
             if not latex:
                 raise ValueError("模型返回为空")
@@ -1249,6 +1865,12 @@ def write_article(state: over_all_state) -> dict:
             # 失败也写占位，保证 \\input 不报缺文件
             target.write_text(f"% 本章（{fname}）生成失败：{e}\n", encoding="utf-8")
             done.append(f"{fname}(失败:{e})")
+
+    # 2.5 AI 工具使用声明(2026 规定: 参考文献之前; 固定句式程序化拼装,不经 LLM)
+    (latex_out() / "texfile" / "8aAIDeclaration.tex").write_text(
+        _build_ai_declaration(ai_events_snapshot()), encoding="utf-8")
+    _ensure_ai_declaration_input()
+    done.append("8aAIDeclaration")
 
     # 3. 编译验证与自愈：真实编译一遍，有错误就把日志喂回 LLM 修复，直到零错误或用完修复轮数
     xe = _find_xelatex()
@@ -1275,9 +1897,11 @@ def write_article(state: over_all_state) -> dict:
                               f"请人工查看 paper/latex/document.log")
         logger.info(f"论文编译验证结果：{compile_status}")
 
+    details_msg = _write_ai_details_pdf()
     return {"article_chapters": done,
             "compile_status": compile_status,
-            "messages": [AIMessage(content="已生成 LaTeX 论文章节：" + "、".join(done) + f"；{compile_status}")]}
+            "messages": [AIMessage(content="已生成 LaTeX 论文章节：" + "、".join(done)
+                                   + f"；{compile_status}；{details_msg}")]}
 
 
 # 回填 document.tex 封面元信息：标题由 LLM 自动生成，题号/报名号/学校/年份由人工 interrupt 提供
@@ -1294,6 +1918,7 @@ def fill_document_meta(state: over_all_state) -> dict:
         "第2行 报名号\n"
         "第3行 学校名称\n"
         "第4行 年份(如 2025)\n"
+        "第5行 AI声明用途短语(回车=按运行记录自动生成)\n"
         "直接回车=全部用模板默认"
     )
     lines = (meta or "").splitlines()
@@ -1301,6 +1926,12 @@ def fill_document_meta(state: over_all_state) -> dict:
     baoming = lines[1].strip() if len(lines) > 1 else ""
     school = lines[2].strip() if len(lines) > 2 else ""
     year = lines[3].strip() if len(lines) > 3 else ""
+    ai_phrase = lines[4].strip() if len(lines) > 4 else ""
+    # AI 声明按人工确认的用途短语重写(顺带在老工作区补齐声明章节),随元信息回填后的重编译一并生效
+    (latex_out() / "texfile" / "8aAIDeclaration.tex").write_text(
+        _build_ai_declaration(ai_events_snapshot(), ai_phrase), encoding="utf-8")
+    _ensure_ai_declaration_input()
+    log_ai_event("人工审查", f"封面信息与 AI 声明确认(用途短语: {ai_phrase or '自动生成'})")
 
     text = doc_path.read_text(encoding="utf-8")
 
@@ -1360,6 +1991,7 @@ builder=StateGraph(state_schema=over_all_state, input=input_state)
 builder.add_node('load_problem', load_problem) 
 builder.add_node('question_structed',question_structed)
 builder.add_node('modeling',modeling)
+builder.add_node('debate_plan',debate_plan)
 builder.add_node('read_dataset',read_dataset)
 builder.add_node('tool_node',tool_node)
 builder.add_node('review_modeling_analysis',review_modeling_analysis)
@@ -1383,9 +2015,10 @@ builder.add_edge('read_dataset',"modeling")
 builder.add_conditional_edges(
     "modeling",
     modeling_route,
-    {"tools": "tool_node", "review": "review_modeling_analysis"}
+    {"tools": "tool_node", "review": "debate_plan"}
 )
 builder.add_edge("tool_node", "modeling")
+builder.add_edge("debate_plan", "review_modeling_analysis")
 builder.add_edge("review_modeling_analysis", "send_problem_index")
 builder.add_conditional_edges(
     "send_problem_index",

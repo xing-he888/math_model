@@ -12,6 +12,7 @@ function createWindow() {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
+      plugins: true, // 启用 Chromium PDF 插件, 支持前端内嵌预览生成的论文 PDF
     },
   });
 

@@ -39,7 +39,7 @@ import shutil
 import re
 import time
 
-from src.agent import graph, checkpointer, set_model, list_models
+from src.agent import graph, checkpointer, set_model, list_models, usage_snapshot, reset_usage, reset_ai_log
 from src.models import MODEL_REGISTRY
 from src.tool import set_workspace, get_workspace, ws_root
 
@@ -57,6 +57,7 @@ UI_DEFAULTS = {
     "accent": "#4f8cff",       # 强调色（配色预设 + 自定义）
     "glassAlpha": 12,          # 玻璃透明度 0-60，越大越透
     "glassColor": "#ffffff",   # 玻璃基底色
+    "textColor": "",           # 文字主色(""=跟随主题默认, 七位hex=全局覆盖 --text)
     "blur": 16,                # 玻璃模糊半径 px（0 = 关闭毛玻璃）
     "scrim": 0.25,             # 背景压暗 0-1
     "border": 0.35,            # 边框强调 0-1
@@ -95,6 +96,8 @@ def _load_ui_config() -> dict:
             continue
         if k in ("accent", "glassColor") and isinstance(v, str) and len(v) == 7 and v.startswith("#"):
             out[k] = v
+        elif k == "textColor" and isinstance(v, str) and (v == "" or (len(v) == 7 and v.startswith("#"))):
+            out[k] = v
         elif k == "objectFit" and v in ("cover", "contain", "center", "fill"):
             out[k] = v
         elif k == "bgMode" and v in ("image", "video", "carousel"):
@@ -127,6 +130,8 @@ def _save_ui_config(patch: dict) -> dict:
             continue
         if k in ("accent", "glassColor"):
             cfg[k] = v if isinstance(v, str) and len(v) == 7 and v.startswith("#") else UI_DEFAULTS[k]
+        elif k == "textColor":
+            cfg[k] = v if isinstance(v, str) and (v == "" or (len(v) == 7 and v.startswith("#"))) else UI_DEFAULTS[k]
         elif k == "objectFit":
             cfg[k] = v if v in ("cover", "contain", "center", "fill") else UI_DEFAULTS[k]
         elif k == "bgMode":
@@ -276,6 +281,27 @@ def _msg_summary(msg: dict) -> dict:
     return {"role": mtype, "content": str(msg.get("content") or "")[:300]}
 
 
+def _chunk_texts(chunk) -> tuple:
+    """从流式 AIMessageChunk 提取 (正文增量, 思考增量)。
+    思考链: 各家 OpenAI 兼容推理模型放在 additional_kwargs.reasoning_content
+    (ChatDeepSeek 与 models.py 的捕获子类均写入此字段)。"""
+    ak = getattr(chunk, "additional_kwargs", None) or {}
+    rc = ak.get("reasoning_content")
+    think = rc if isinstance(rc, str) else ""
+    c = getattr(chunk, "content", None)
+    if isinstance(c, str):
+        text = c
+    elif isinstance(c, list):
+        text = "".join(
+            p.get("text", "") if isinstance(p, dict) else str(p)
+            for p in c
+            if isinstance(p, str) or (isinstance(p, dict) and p.get("type") == "text")
+        )
+    else:
+        text = ""
+    return text, think
+
+
 def _simplify(payload) -> dict:
     """过滤 update 载荷里的巨型字段(完整 messages 等), 只留前端需要的摘要"""
     if not isinstance(payload, dict):
@@ -331,14 +357,31 @@ async def _stream_events(resume: Optional[str], thread_id: str, model: Optional[
         agen = graph.astream(
             inputs,
             config=runtime_config,
-            stream_mode="updates",
+            stream_mode=["updates", "messages"],  # updates:节点级状态; messages:LLM token 级流式
         )
         try:
-            async for update in agen:
-                if not isinstance(update, dict):
+            async for smode, item in agen:
+                if smode == "messages":
+                    # (AIMessageChunk, metadata): 思考/正文增量实时转发,前端打字机展示
+                    chunk, meta = item
+                    text, think = _chunk_texts(chunk)
+                    if not text and not think:
+                        continue  # 纯工具调用块等无文本增量
+                    node = (meta or {}).get("langgraph_node") or ""
+                    mid = getattr(chunk, "id", None) or ""
+                    if think:
+                        out_q.put_nowait(("chunk", _sse({
+                            "type": "reasoning", "text": think, "node": node, "mid": mid,
+                        })))
+                    if text:
+                        out_q.put_nowait(("chunk", _sse({
+                            "type": "token", "text": text, "node": node, "mid": mid,
+                        })))
+                    continue
+                if not isinstance(item, dict):
                     continue
                 stop = False
-                for node, payload in update.items():
+                for node, payload in item.items():
                     if node == "__interrupt__" and isinstance(payload, (list, tuple)):
                         its = [{"value": getattr(it, "value", str(it))} for it in payload]
                     else:
@@ -405,6 +448,8 @@ async def _stream_events(resume: Optional[str], thread_id: str, model: Optional[
                     except Exception:
                         pass
                     inputs = {}
+                    reset_usage()  # 无可续状态按新运行处理, 用量统计一并归零
+                    reset_ai_log()  # AI 使用事件同样归零(声明只反映本次运行)
                 elif has_interrupt:
                     inputs = Command(resume="")
                 else:
@@ -418,6 +463,8 @@ async def _stream_events(resume: Optional[str], thread_id: str, model: Optional[
                 except Exception:
                     pass
                 inputs = {}
+                reset_usage()  # 新运行用量统计归零, 前端展示本次运行的真实消耗
+                reset_ai_log()  # AI 使用事件同样归零(声明只反映本次运行)
             pump_task = asyncio.create_task(_pump(inputs))
             logger.info(f"[stream] 锁已获取,pump 已调度 (thread={thread_id})")
             while True:
@@ -511,6 +558,13 @@ async def get_state(thread_id: str = DEFAULT_THREAD_ID):
     }
 
 
+@app.get("/api/usage")
+async def get_usage():
+    """Token 消耗与缓存命中统计(全局累计; /api/reset 与每次新运行时清零)。
+    缓存命中率仅 DeepSeek/OpenAI 接口返回, 其余模型前端显示"—"。"""
+    return usage_snapshot()
+
+
 @app.post("/api/stream")
 async def stream_run(body: StreamBody):
     thread_id = body.thread_id or DEFAULT_THREAD_ID
@@ -531,14 +585,26 @@ async def stream_run(body: StreamBody):
     )
 
 
-def _resolve_work_path(work_dir: str, rel_path: str = "") -> Path:
-    """校验并解析当前题目工作区路径, 非法路径抛 400"""
+def _browsing_root(thread_id: str = "") -> Path:
+    """浏览类接口(files/file/image/pdfs/pdf)的工作区根：
+    带 thread_id 时按题查询——多题并行下全局兜底指针(_CURRENT_WS)会被后启动的运行占用,
+    前端按题传参才能保证产物面板不串台;不传则沿用全局兜底(旧行为,向后兼容)。"""
+    if not thread_id:
+        return ws_root()
+    tid = thread_id.strip()
+    if not tid or "/" in tid or "\\" in tid or ".." in tid:
+        raise HTTPException(400, f"非法题目 id: {thread_id!r}")
+    return WORKSPACES_ROOT / tid
+
+
+def _resolve_work_path(work_dir: str, rel_path: str = "", thread_id: str = "") -> Path:
+    """校验并解析指定题目工作区路径, 非法路径抛 400"""
     if work_dir not in ALLOWED_WORK_DIRS:
         raise HTTPException(400, f"work_dir 只能是 {'/'.join(sorted(ALLOWED_WORK_DIRS))}, 收到: {work_dir!r}")
     p = Path(rel_path) if rel_path else Path(".")
     if p.is_absolute() or ".." in p.parts:
         raise HTTPException(400, f"rel_path 必须是相对路径且不能包含 '..': {rel_path}")
-    base = ws_root()
+    base = _browsing_root(thread_id)
     target = (base / work_dir / p).resolve()
     if not target.is_relative_to((base / work_dir).resolve()):
         raise HTTPException(400, f"路径超出 {work_dir} 目录: {rel_path}")
@@ -546,11 +612,12 @@ def _resolve_work_path(work_dir: str, rel_path: str = "") -> Path:
 
 
 @app.get("/api/files")
-async def list_files(work_dir: str):
-    """列出当前题目工作区目录下的文件与文件夹(名称+大小), 供前端实时刷新"""
+async def list_files(work_dir: str, thread_id: str = ""):
+    """列出题目工作区目录下的文件与文件夹(名称+大小), 供前端实时刷新;
+    thread_id 缺省时用全局兜底工作区(旧行为)"""
     if work_dir not in ALLOWED_WORK_DIRS:
         raise HTTPException(400, f"work_dir 只能是 {'/'.join(sorted(ALLOWED_WORK_DIRS))}")
-    root = ws_root() / work_dir
+    root = _browsing_root(thread_id) / work_dir
     if not root.is_dir():
         return {"work_dir": work_dir, "files": []}
     items = []
@@ -563,9 +630,9 @@ async def list_files(work_dir: str):
 
 
 @app.get("/api/file")
-async def read_file(work_dir: str, rel_path: str = ""):
+async def read_file(work_dir: str, rel_path: str = "", thread_id: str = ""):
     """读取工作区文本文件(思路/代码/dataset), 返回文本内容"""
-    target = _resolve_work_path(work_dir, rel_path)
+    target = _resolve_work_path(work_dir, rel_path, thread_id)
     if not target.is_file():
         raise HTTPException(404, f"文件不存在: {target}")
     if target.suffix.lower() in (".png", ".jpg", ".jpeg", ".gif", ".bmp"):
@@ -577,12 +644,45 @@ async def read_file(work_dir: str, rel_path: str = ""):
 
 
 @app.get("/api/image")
-async def get_image(work_dir: str, rel_path: str = ""):
+async def get_image(work_dir: str, rel_path: str = "", thread_id: str = ""):
     """读取工作区图片(photo 下的 png 等), 二进制返回"""
-    target = _resolve_work_path(work_dir, rel_path)
+    target = _resolve_work_path(work_dir, rel_path, thread_id)
     if not target.is_file():
         raise HTTPException(404, f"图片不存在: {target}")
     return FileResponse(str(target))
+
+
+# ---------- PDF 产物展示: 前端内嵌预览生成的论文与合规文档 ----------
+_PDF_TARGETS = [
+    ("竞赛论文", "paper/latex/document.pdf"),
+    ("AI 工具使用详情", "AI 工具使用详情.pdf"),
+]
+
+
+@app.get("/api/pdfs")
+async def list_pdfs(thread_id: str = ""):
+    """列出当前题目的 PDF 产物(存在才列出), 供前端产物面板展示"""
+    root = _browsing_root(thread_id)
+    out = []
+    for name, rel in _PDF_TARGETS:
+        p = root / rel
+        if p.is_file():
+            out.append({"name": name, "path": rel, "size": p.stat().st_size})
+    return {"pdfs": out}
+
+
+@app.get("/api/pdf")
+async def get_pdf(path: str, thread_id: str = ""):
+    """返回工作区内 PDF 文件(仅限 .pdf 且禁止路径越界), 供前端内嵌预览"""
+    root = _browsing_root(thread_id)
+    if not path.lower().endswith(".pdf") or ".." in path.replace("\\", "/").split("/"):
+        raise HTTPException(400, "非法 PDF 路径")
+    p = (root / path).resolve()
+    if not p.is_relative_to(root.resolve()):
+        raise HTTPException(400, "路径越界")
+    if not p.is_file():
+        raise HTTPException(404, "PDF 不存在")
+    return FileResponse(str(p), media_type="application/pdf")
 
 
 @app.get("/api/ui-config")
@@ -917,10 +1017,51 @@ async def we_file(id: str = ""):
     return FileResponse(str(target))
 
 
+@app.delete("/api/file")
+async def delete_artifact(rel_path: str, thread_id: str = ""):
+    """删除题目工作区内单个产物文件(思路/代码/图片/PDF, rel_path 相对工作区根)。
+    运行中的题目禁止删除——防止删掉 agent 正在读写的东西(与重置/删题同一保护)。"""
+    ws_id = thread_id.strip() or get_workspace()
+    _guard_ws_mutation(ws_id)
+    if not rel_path or rel_path.strip() in ("", "."):
+        raise HTTPException(400, "rel_path 不能为空")
+    p = Path(rel_path)
+    if p.is_absolute() or ".." in p.parts:
+        raise HTTPException(400, f"非法路径: {rel_path}")
+    root = _browsing_root(thread_id)
+    target = (root / p).resolve()
+    if not target.is_relative_to(root.resolve()):
+        raise HTTPException(400, f"路径越界: {rel_path}")
+    if not target.is_file():
+        raise HTTPException(404, f"文件不存在: {rel_path}")
+    target.unlink()
+    logger.info(f"删除产物: {target}")
+    return {"status": "deleted", "path": rel_path}
+
+
+@app.delete("/api/workspaces/{ws_id}/file")
+async def delete_ws_file(ws_id: str, target: str = "question", name: str = ""):
+    """删除题目工作区里上传的题目/数据文件(target=question|dataset)。
+    运行中的题目禁止删除(load_problem/read_dataset 可能还要读它)。"""
+    _guard_ws_mutation(ws_id)
+    if target not in ("question", "dataset"):
+        raise HTTPException(400, "target 只能是 question / dataset")
+    if not name or "/" in name or "\\" in name or ".." in name:
+        raise HTTPException(400, "非法文件名")
+    f = _ws_dir(ws_id) / target / name
+    if not f.is_file():
+        raise HTTPException(404, f"文件不存在: {name}")
+    f.unlink()
+    logger.info(f"删除题目文件: {f}")
+    return {"status": "deleted", "target": target, "name": name}
+
+
 @app.post("/api/reset")
 async def reset_thread(thread_id: str = DEFAULT_THREAD_ID):
     _guard_ws_mutation(thread_id)
     set_workspace(thread_id)
+    reset_usage()  # 用量统计属于展示层全局态, 与线程一并重置
+    reset_ai_log()  # AI 使用事件一并清零
     try:
         checkpointer.delete_thread(thread_id)
     except Exception:
