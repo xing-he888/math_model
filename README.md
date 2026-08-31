@@ -77,7 +77,7 @@ npm start
 
 
 
-## 此项目有DeepSeek/GPT (OpenAI)/GLM (智谱 Zhipu)/通义千问 (Qwen)/Kimi (Moonshot)/MiniMax (Mimo)，在项目运行过程中，可以做到多模型的热切换
+## 此项目有DeepSeek/GPT (OpenAI)/GLM (智谱 Zhipu)/通义千问 (Qwen)/Kimi /MiniMax ，在项目运行过程中，可以做到多模型的热切换
 
 ## 需要本机下载texlive才可正常生成论文
 
